@@ -250,8 +250,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "iron-proxy") | nindent 14 }}
         - podSelector:
-            matchLabels:
-              centaur.ai/managed: "true"
+            matchExpressions:
+              - key: centaur.ai/sandbox-id
+                operator: Exists
+              - key: centaur.ai/iron-proxy
+                operator: DoesNotExist
         - podSelector:
             matchLabels:
               centaur.ai/iron-proxy: "true"
@@ -584,8 +587,11 @@ metadata:
 {{ include "centaur.labels" . | nindent 4 }}
 spec:
   podSelector:
-    matchLabels:
-      centaur.ai/managed: "true"
+    matchExpressions:
+      - key: centaur.ai/sandbox-id
+        operator: Exists
+      - key: centaur.ai/iron-proxy
+        operator: DoesNotExist
   policyTypes:
     - Egress
   egress:

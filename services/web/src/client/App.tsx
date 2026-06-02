@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
-import { Bot, CheckCircle2, Circle, CircleAlert, LoaderCircle, Plus, Send, Terminal } from 'lucide-react'
-import { Button, Frame, Input, Rows, Tag } from 'regen-ui'
+import { CheckCircle2, Circle, CircleAlert, LoaderCircle, Plus, Send, Terminal } from 'lucide-react'
+import { Button, Input, Tag } from 'regen-ui'
 import type { WebRendererOutput, WebRendererTask } from '@centaur/rendering'
 
 type ChatMessage = {
@@ -9,19 +9,31 @@ type ChatMessage = {
   text: string
 }
 
+type ThreadSummary = {
+  id: string
+  lastMessage: string
+  status: string
+  title: string
+}
+
 type StreamEvent = {
   data: WebRendererOutput
   id?: number
 }
 
+const INITIAL_THREAD_ID = newThreadId()
+
 export function App() {
-  const [threadId, setThreadId] = useState(() => newThreadId())
+  const [threadId, setThreadId] = useState(INITIAL_THREAD_ID)
   const [lastEventId, setLastEventId] = useState(0)
   const [title, setTitle] = useState('Centaur Web')
   const [status, setStatus] = useState('Idle')
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [tasks, setTasks] = useState<WebRendererTask[]>([])
+  const [threads, setThreads] = useState<ThreadSummary[]>(() => [
+    createThreadSummary(INITIAL_THREAD_ID)
+  ])
   const [planTitle, setPlanTitle] = useState('')
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
@@ -35,6 +47,11 @@ export function App() {
     setInput('')
     setStreaming(true)
     setStatus('Starting')
+    updateThread(threadId, {
+      lastMessage: message,
+      status: 'Starting',
+      title: threadTitleFromMessage(message)
+    })
     const userMessage: ChatMessage = { id: newMessageId(), role: 'user', text: message }
     const assistantMessage: ChatMessage = { id: newMessageId(), role: 'assistant', text: '' }
     assistantIdRef.current = assistantMessage.id
@@ -58,6 +75,7 @@ export function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setStatus('Error')
+      updateThread(threadId, { status: 'Error' })
       updateAssistant(text => `${text}${text ? '\n\n' : ''}${message}`)
     } finally {
       setStreaming(false)
@@ -67,6 +85,7 @@ export function App() {
   function applyOutput(output: WebRendererOutput) {
     if (output.type === 'web.status.update') {
       setStatus(output.status)
+      updateThread(threadId, { status: output.status })
       return
     }
     if (output.type === 'web.message.delta') {
@@ -87,9 +106,12 @@ export function App() {
     }
     if (output.type === 'web.title.update') {
       setTitle(output.title)
+      updateThread(threadId, { title: output.title })
       return
     }
-    setStatus(output.error ? 'Error' : 'Complete')
+    const nextStatus = output.error ? 'Error' : 'Complete'
+    setStatus(nextStatus)
+    updateThread(threadId, { status: nextStatus })
     if (output.answerMarkdown) {
       updateAssistant(text => (text.trim() ? text : output.answerMarkdown ?? ''))
     }
@@ -109,7 +131,9 @@ export function App() {
   }
 
   function resetThread() {
-    setThreadId(newThreadId())
+    const nextThreadId = newThreadId()
+    setThreads(current => [createThreadSummary(nextThreadId), ...current])
+    setThreadId(nextThreadId)
     setLastEventId(0)
     setTitle('Centaur Web')
     setStatus('Idle')
@@ -119,42 +143,48 @@ export function App() {
     assistantIdRef.current = null
   }
 
+  function selectThread(thread: ThreadSummary) {
+    if (streaming || thread.id === threadId) return
+    setThreadId(thread.id)
+    setLastEventId(0)
+    setTitle(thread.title === 'New thread' ? 'Centaur Web' : thread.title)
+    setStatus(thread.status)
+    setMessages([])
+    setTasks([])
+    setPlanTitle('')
+    assistantIdRef.current = null
+  }
+
+  function updateThread(id: string, patch: Partial<ThreadSummary>) {
+    setThreads(current =>
+      current.map(thread => (thread.id === id ? { ...thread, ...patch } : thread))
+    )
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand-row">
-          <div className="brand-mark">
-            <Bot size={18} />
-          </div>
-          <div className="min-w-0">
-            <div className="brand-title">Centaur</div>
-            <div className="thread-key">{threadId}</div>
-          </div>
+        <div className="sidebar-top">
+          <Button icon={<Plus size={16} />} onClick={resetThread} size="small" variant="secondary">
+            New Thread
+          </Button>
         </div>
 
-        <Button icon={<Plus size={16} />} onClick={resetThread} size="small" variant="secondary">
-          New Thread
-        </Button>
-
-        <Frame title="Run State" variant="plain" className="side-panel">
-          <Rows variant="pane">
-            <Rows.Row label="Status">
-              <Tag dot intent={streaming ? 'info' : status === 'Error' ? 'negative' : 'positive'}>
-                {status}
-              </Tag>
-            </Rows.Row>
-            <Rows.Row label="Events">{lastEventId}</Rows.Row>
-            <Rows.Row label="Tasks">
-              {completedTasks}/{taskCount}
-            </Rows.Row>
-          </Rows>
-        </Frame>
-
-        {planTitle && (
-          <Frame title="Plan" variant="plain" className="side-panel">
-            <p className="plan-title">{planTitle}</p>
-          </Frame>
-        )}
+        <nav className="thread-list" aria-label="Threads">
+          {threads.map(thread => (
+            <button
+              className={`thread-item ${thread.id === threadId ? 'active' : ''}`}
+              disabled={streaming}
+              key={thread.id}
+              onClick={() => selectThread(thread)}
+              type="button"
+            >
+              <span className="thread-title">{thread.title}</span>
+              <span className="thread-key">{thread.id}</span>
+              {thread.lastMessage && <span className="thread-preview">{thread.lastMessage}</span>}
+            </button>
+          ))}
+        </nav>
       </aside>
 
       <section className="workspace">
@@ -162,9 +192,16 @@ export function App() {
           <div className="min-w-0">
             <h1>{title}</h1>
             <div className="topbar-meta">
+              <Tag dot intent={streaming ? 'info' : status === 'Error' ? 'negative' : 'positive'}>
+                {status}
+              </Tag>
               <Tag>Rust V2</Tag>
               <Tag>Codex</Tag>
               <Tag>Renderer</Tag>
+              <Tag>Events {lastEventId}</Tag>
+              <Tag>
+                Tasks {completedTasks}/{taskCount}
+              </Tag>
             </div>
           </div>
         </header>
@@ -210,6 +247,7 @@ export function App() {
           <section className="activity">
             <div className="activity-header">
               <h2>Activity</h2>
+              {planTitle && <div className="plan-title">{planTitle}</div>}
             </div>
             <div className="task-list">
               {sortedTasks.length === 0 ? (
@@ -288,6 +326,20 @@ function upsertTask(tasks: WebRendererTask[], task: WebRendererTask): WebRendere
   const index = tasks.findIndex(item => item.id === task.id)
   if (index < 0) return [...tasks, task]
   return tasks.map(item => (item.id === task.id ? task : item))
+}
+
+function createThreadSummary(threadId: string): ThreadSummary {
+  return {
+    id: threadId,
+    lastMessage: '',
+    status: 'Idle',
+    title: 'New thread'
+  }
+}
+
+function threadTitleFromMessage(message: string): string {
+  const trimmed = message.trim().replace(/\s+/g, ' ')
+  return trimmed.length > 42 ? `${trimmed.slice(0, 39)}...` : trimmed || 'New thread'
 }
 
 async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncIterable<StreamEvent> {
