@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Blocks, Clock3, Search, Send, SquarePen } from 'lucide-react'
 import { Button, Input, Tag } from 'regen-ui'
 import type { WebRendererOutput } from '@centaur/rendering'
@@ -36,6 +36,20 @@ export function App() {
   const assistantIdRef = useRef<string | null>(null)
   const activeThread = threads.find(thread => thread.id === threadId) ?? threads[0]
   const title = activeThread?.title ?? 'New chat'
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      const key = event.key.toLowerCase()
+      const isNewChatShortcut =
+        key === 'n' && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey
+      if (!isNewChatShortcut) return
+      event.preventDefault()
+      resetThread()
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
 
   async function submit() {
     const message = input.trim()
@@ -152,7 +166,12 @@ export function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <nav className="sidebar-actions" aria-label="Actions">
-          <button className="sidebar-action primary" onClick={resetThread} type="button">
+          <button
+            aria-keyshortcuts="Meta+N Control+N"
+            className="sidebar-action primary"
+            onClick={resetThread}
+            type="button"
+          >
             <SquarePen size={20} />
             <span>New chat</span>
             <kbd>⌘N</kbd>
