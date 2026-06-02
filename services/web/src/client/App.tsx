@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { Plus, Send } from 'lucide-react'
+import { Blocks, Clock3, Search, Send, SquarePen } from 'lucide-react'
 import { Button, Input, Tag } from 'regen-ui'
 import type { WebRendererOutput } from '@centaur/rendering'
 
@@ -26,7 +26,6 @@ const INITIAL_THREAD_ID = newThreadId()
 export function App() {
   const [threadId, setThreadId] = useState(INITIAL_THREAD_ID)
   const [lastEventId, setLastEventId] = useState(0)
-  const [title, setTitle] = useState('Centaur Web')
   const [status, setStatus] = useState('Idle')
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -35,6 +34,8 @@ export function App() {
   ])
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
+  const activeThread = threads.find(thread => thread.id === threadId) ?? threads[0]
+  const title = activeThread?.title ?? 'New chat'
 
   async function submit() {
     const message = input.trim()
@@ -98,7 +99,6 @@ export function App() {
       return
     }
     if (output.type === 'web.title.update') {
-      setTitle(output.title)
       updateThread(threadId, { title: output.title })
       return
     }
@@ -128,7 +128,6 @@ export function App() {
     setThreads(current => [createThreadSummary(nextThreadId), ...current])
     setThreadId(nextThreadId)
     setLastEventId(0)
-    setTitle('Centaur Web')
     setStatus('Idle')
     setMessages([])
     assistantIdRef.current = null
@@ -138,7 +137,6 @@ export function App() {
     if (streaming || thread.id === threadId) return
     setThreadId(thread.id)
     setLastEventId(0)
-    setTitle(thread.title === 'New thread' ? 'Centaur Web' : thread.title)
     setStatus(thread.status)
     setMessages([])
     assistantIdRef.current = null
@@ -153,11 +151,25 @@ export function App() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="sidebar-top">
-          <Button icon={<Plus size={16} />} onClick={resetThread} size="small" variant="secondary">
-            New Thread
-          </Button>
-        </div>
+        <nav className="sidebar-actions" aria-label="Actions">
+          <button className="sidebar-action primary" onClick={resetThread} type="button">
+            <SquarePen size={20} />
+            <span>New chat</span>
+            <kbd>⌘N</kbd>
+          </button>
+          <button className="sidebar-action" type="button">
+            <Search size={20} />
+            <span>Search</span>
+          </button>
+          <button className="sidebar-action" type="button">
+            <Blocks size={20} />
+            <span>Plugins</span>
+          </button>
+          <button className="sidebar-action" type="button">
+            <Clock3 size={20} />
+            <span>Automations</span>
+          </button>
+        </nav>
 
         <nav className="thread-list" aria-label="Threads">
           {threads.map(thread => (
@@ -181,7 +193,7 @@ export function App() {
           <div className="min-w-0">
             <h1>{title}</h1>
             <div className="topbar-meta">
-              <Tag>{status}</Tag>
+              {status !== 'Idle' && <Tag>{status}</Tag>}
               <Tag>Rust V2</Tag>
               <Tag>Codex</Tag>
               <Tag>Renderer</Tag>
@@ -265,13 +277,13 @@ function createThreadSummary(threadId: string): ThreadSummary {
     id: threadId,
     lastMessage: '',
     status: 'Idle',
-    title: 'New thread'
+    title: 'New chat'
   }
 }
 
 function threadTitleFromMessage(message: string): string {
   const trimmed = message.trim().replace(/\s+/g, ' ')
-  return trimmed.length > 42 ? `${trimmed.slice(0, 39)}...` : trimmed || 'New thread'
+  return trimmed.length > 42 ? `${trimmed.slice(0, 39)}...` : trimmed || 'New chat'
 }
 
 async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncIterable<StreamEvent> {
