@@ -271,7 +271,7 @@ export function App() {
                 aria-label="Message"
                 disabled={streaming}
                 onChange={event => setInput(event.target.value)}
-                placeholder="Ask Codex"
+                placeholder="Ask Centaur for anything"
                 value={input}
               />
               <Button disabled={!input.trim()} icon={<Send size={16} />} loading={streaming} type="submit">
