@@ -6,6 +6,7 @@ import type { WebRendererOutput, WebRendererTask } from '@centaur/rendering'
 type ChatMessage = {
   id: string
   role: 'assistant' | 'user'
+  tasks?: WebRendererTask[]
   text: string
 }
 
@@ -34,7 +35,6 @@ export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>(() => [
     createThreadSummary(INITIAL_THREAD_ID)
   ])
-  const [taskItems, setTaskItems] = useState<WebRendererTask[]>([])
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
@@ -43,7 +43,6 @@ export function App() {
   const visibleThreads = searchQuery.trim()
     ? threads.filter(thread => threadMatchesSearch(thread, searchQuery))
     : threads
-  const displayedTasks = visibleTasks(taskItems)
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -70,14 +69,13 @@ export function App() {
     setInput('')
     setStreaming(true)
     setStatus('Starting')
-    setTaskItems([])
     updateThread(threadId, {
       lastMessage: message,
       status: 'Starting',
       title: threadTitleFromMessage(message)
     })
     const userMessage: ChatMessage = { id: newMessageId(), role: 'user', text: message }
-    const assistantMessage: ChatMessage = { id: newMessageId(), role: 'assistant', text: '' }
+    const assistantMessage: ChatMessage = { id: newMessageId(), role: 'assistant', tasks: [], text: '' }
     assistantIdRef.current = assistantMessage.id
     setMessages(current => [...current, userMessage, assistantMessage])
 
@@ -121,7 +119,7 @@ export function App() {
       return
     }
     if (output.type === 'web.task.upsert') {
-      setTaskItems(current => upsertTaskItem(current, output.task))
+      updateAssistantTask(output.task)
       return
     }
     if (output.type === 'web.plan.update') {
@@ -152,6 +150,18 @@ export function App() {
     )
   }
 
+  function updateAssistantTask(task: WebRendererTask) {
+    const assistantId = assistantIdRef.current
+    if (!assistantId) return
+    setMessages(current =>
+      current.map(message =>
+        message.id === assistantId
+          ? { ...message, tasks: upsertTaskItem(message.tasks ?? [], task) }
+          : message
+      )
+    )
+  }
+
   function resetThread() {
     const nextThreadId = newThreadId()
     setThreads(current => [createThreadSummary(nextThreadId), ...current])
@@ -159,7 +169,6 @@ export function App() {
     setLastEventId(0)
     setStatus('Idle')
     setMessages([])
-    setTaskItems([])
     setSearchOpen(false)
     setSearchQuery('')
     assistantIdRef.current = null
@@ -171,7 +180,6 @@ export function App() {
     setLastEventId(0)
     setStatus(thread.status)
     setMessages([])
-    setTaskItems([])
     assistantIdRef.current = null
   }
 
@@ -259,19 +267,22 @@ export function App() {
         <div className="content-grid">
           <section className="conversation">
             <div className="message-list" aria-live="polite">
-              {displayedTasks.length > 0 && !assistantIdRef.current && (
-                <TaskList tasks={displayedTasks} streaming={streaming} />
-              )}
-              {messages.map(message => (
-                <Fragment key={message.id}>
-                  {displayedTasks.length > 0 && message.id === assistantIdRef.current && (
-                    <TaskList tasks={displayedTasks} streaming={streaming} />
-                  )}
-                  <article className={`message ${message.role}`}>
-                    <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
-                  </article>
-                </Fragment>
-              ))}
+              {messages.map(message => {
+                const messageTasks = visibleTasks(message.tasks ?? [])
+                return (
+                  <Fragment key={message.id}>
+                    {message.role === 'assistant' && messageTasks.length > 0 && (
+                      <TaskList
+                        streaming={streaming && message.id === assistantIdRef.current}
+                        tasks={messageTasks}
+                      />
+                    )}
+                    <article className={`message ${message.role}`}>
+                      <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
+                    </article>
+                  </Fragment>
+                )
+              })}
             </div>
 
             <form
