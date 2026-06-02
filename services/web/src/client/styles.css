@@ -250,31 +250,24 @@ input,
 
 .message {
   max-width: 860px;
-  padding: 13px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel);
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.18);
 }
 
 .message.user {
   align-self: flex-end;
-  border-color: #3a3a3a;
+  max-width: min(560px, 72%);
+  padding: 12px 16px;
+  border: 1px solid #3a3a3a;
+  border-radius: 18px;
   background: #2a2a2a;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2);
 }
 
 .message.assistant {
   align-self: flex-start;
-  border-color: #30362f;
-}
-
-.message-role {
-  margin-bottom: 8px;
-  color: var(--text-dim);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0;
-  text-transform: uppercase;
+  max-width: min(760px, 82%);
+  padding: 2px 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .markdown-text {

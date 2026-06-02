@@ -226,7 +226,6 @@ export function App() {
             <div className="message-list" aria-live="polite">
               {messages.map(message => (
                 <article className={`message ${message.role}`} key={message.id}>
-                  <div className="message-role">{message.role}</div>
                   <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
                 </article>
               ))}
