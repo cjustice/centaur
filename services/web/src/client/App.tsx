@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Blocks, Clock3, Search, Send, SquarePen } from 'lucide-react'
+import { Clock3, Search, Send, SquarePen } from 'lucide-react'
 import { Button, Input, Tag } from 'regen-ui'
 import type { WebRendererOutput } from '@centaur/rendering'
 
@@ -179,10 +179,6 @@ export function App() {
           <button className="sidebar-action" type="button">
             <Search size={20} />
             <span>Search</span>
-          </button>
-          <button className="sidebar-action" type="button">
-            <Blocks size={20} />
-            <span>Plugins</span>
           </button>
           <button className="sidebar-action" type="button">
             <Clock3 size={20} />
