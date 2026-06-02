@@ -146,6 +146,7 @@ input,
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
 }
 
 .topbar {
@@ -182,7 +183,9 @@ input,
 }
 
 .content-grid {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  height: 100%;
   min-height: 0;
 }
 
@@ -191,12 +194,14 @@ input,
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
+  height: 100%;
 }
 
 .message-list {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  min-height: 0;
   overflow: auto;
   padding: 22px 24px;
 }
@@ -300,7 +305,7 @@ pre {
   }
 
   .content-grid {
-    display: block;
+    display: grid;
   }
 }
 
