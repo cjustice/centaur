@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState } from 'react'
-import { CheckCircle2, Circle, CircleAlert, LoaderCircle, Plus, Send, Terminal } from 'lucide-react'
+import { useRef, useState } from 'react'
+import { Plus, Send } from 'lucide-react'
 import { Button, Input, Tag } from 'regen-ui'
-import type { WebRendererOutput, WebRendererTask } from '@centaur/rendering'
+import type { WebRendererOutput } from '@centaur/rendering'
 
 type ChatMessage = {
   id: string
@@ -30,16 +30,11 @@ export function App() {
   const [status, setStatus] = useState('Idle')
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [tasks, setTasks] = useState<WebRendererTask[]>([])
   const [threads, setThreads] = useState<ThreadSummary[]>(() => [
     createThreadSummary(INITIAL_THREAD_ID)
   ])
-  const [planTitle, setPlanTitle] = useState('')
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
-  const taskCount = tasks.length
-  const completedTasks = tasks.filter(task => task.status === 'complete').length
-  const sortedTasks = useMemo(() => tasks, [tasks])
 
   async function submit() {
     const message = input.trim()
@@ -97,11 +92,9 @@ export function App() {
       return
     }
     if (output.type === 'web.task.upsert') {
-      setTasks(current => upsertTask(current, output.task))
       return
     }
     if (output.type === 'web.plan.update') {
-      setPlanTitle(output.title)
       return
     }
     if (output.type === 'web.title.update') {
@@ -138,8 +131,6 @@ export function App() {
     setTitle('Centaur Web')
     setStatus('Idle')
     setMessages([])
-    setTasks([])
-    setPlanTitle('')
     assistantIdRef.current = null
   }
 
@@ -150,8 +141,6 @@ export function App() {
     setTitle(thread.title === 'New thread' ? 'Centaur Web' : thread.title)
     setStatus(thread.status)
     setMessages([])
-    setTasks([])
-    setPlanTitle('')
     assistantIdRef.current = null
   }
 
@@ -192,16 +181,11 @@ export function App() {
           <div className="min-w-0">
             <h1>{title}</h1>
             <div className="topbar-meta">
-              <Tag dot intent={streaming ? 'info' : status === 'Error' ? 'negative' : 'positive'}>
-                {status}
-              </Tag>
+              <Tag>{status}</Tag>
               <Tag>Rust V2</Tag>
               <Tag>Codex</Tag>
               <Tag>Renderer</Tag>
               <Tag>Events {lastEventId}</Tag>
-              <Tag>
-                Tasks {completedTasks}/{taskCount}
-              </Tag>
             </div>
           </div>
         </header>
@@ -209,19 +193,12 @@ export function App() {
         <div className="content-grid">
           <section className="conversation">
             <div className="message-list" aria-live="polite">
-              {messages.length === 0 ? (
-                <div className="empty-pane">
-                  <Terminal size={20} />
-                  <span>Ready</span>
-                </div>
-              ) : (
-                messages.map(message => (
-                  <article className={`message ${message.role}`} key={message.id}>
-                    <div className="message-role">{message.role}</div>
-                    <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
-                  </article>
-                ))
-              )}
+              {messages.map(message => (
+                <article className={`message ${message.role}`} key={message.id}>
+                  <div className="message-role">{message.role}</div>
+                  <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
+                </article>
+              ))}
             </div>
 
             <form
@@ -243,48 +220,9 @@ export function App() {
               </Button>
             </form>
           </section>
-
-          <section className="activity">
-            <div className="activity-header">
-              <h2>Activity</h2>
-              {planTitle && <div className="plan-title">{planTitle}</div>}
-            </div>
-            <div className="task-list">
-              {sortedTasks.length === 0 ? (
-                <div className="task-empty">No activity</div>
-              ) : (
-                sortedTasks.map(task => <TaskRow key={task.id} task={task} />)
-              )}
-            </div>
-          </section>
         </div>
       </section>
     </main>
-  )
-}
-
-function TaskRow(props: { task: WebRendererTask }) {
-  const { task } = props
-  const icon =
-    task.status === 'complete' ? (
-      <CheckCircle2 size={16} />
-    ) : task.status === 'error' ? (
-      <CircleAlert size={16} />
-    ) : task.status === 'in_progress' ? (
-      <LoaderCircle className="spin" size={16} />
-    ) : (
-      <Circle size={16} />
-    )
-
-  return (
-    <article className={`task ${task.status}`}>
-      <div className="task-title">
-        {icon}
-        <span>{task.title}</span>
-      </div>
-      {task.details && <MarkdownText className="task-body" text={task.details} />}
-      {task.output && <MarkdownText className="task-output" text={task.output} />}
-    </article>
   )
 }
 
@@ -320,12 +258,6 @@ function splitCodeFences(value: string): Array<{ kind: 'code' | 'text'; text: st
   const tail = value.slice(lastIndex).trim()
   if (tail) parts.push({ kind: 'text', text: tail })
   return parts.length ? parts : [{ kind: 'text', text: value }]
-}
-
-function upsertTask(tasks: WebRendererTask[], task: WebRendererTask): WebRendererTask[] {
-  const index = tasks.findIndex(item => item.id === task.id)
-  if (index < 0) return [...tasks, task]
-  return tasks.map(item => (item.id === task.id ? task : item))
 }
 
 function createThreadSummary(threadId: string): ThreadSummary {
