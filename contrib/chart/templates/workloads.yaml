@@ -459,6 +459,7 @@ spec:
                 path: services/sandbox/SYSTEM_PROMPT.md
 {{- end }}
 ---
+{{- end }}
 {{- if .Values.web.enabled }}
 apiVersion: apps/v1
 kind: Deployment
