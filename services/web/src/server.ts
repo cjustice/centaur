@@ -15,6 +15,8 @@ const options: CentaurWebOptions = {
   apiKey: optionalEnv('CENTAUR_API_KEY') ?? optionalEnv('SLACKBOT_API_KEY'),
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
+  streamReconnectAttempts: optionalNumberEnv('SESSION_STREAM_RECONNECT_ATTEMPTS'),
+  streamReconnectDelayMs: optionalNumberEnv('SESSION_STREAM_RECONNECT_DELAY_MS'),
   logger: consoleLogger
 }
 

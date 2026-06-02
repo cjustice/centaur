@@ -27,6 +27,9 @@ type NormalizedWebTurnRequest = WebTurnRequest & {
   threadId: string
 }
 
+const DEFAULT_STREAM_RECONNECT_ATTEMPTS = 3
+const DEFAULT_STREAM_RECONNECT_DELAY_MS = 250
+
 export async function* streamWebTurn(
   options: CentaurWebOptions,
   input: WebTurnRequest
@@ -42,16 +45,37 @@ export async function* streamWebTurn(
     logInfo: (event, fields) => options.logger?.info(event, fields)
   })
   const renderer = new WebRenderer()
-  const events = await streamSessionEvents(options, normalized.threadId, normalized.afterEventId ?? 0)
+  let afterEventId = normalized.afterEventId ?? 0
+  let reconnectAttempts = 0
 
-  for await (const source of events) {
-    const eventId = typeof source.eventId === 'number' ? source.eventId : undefined
-    for (const event of mapper.process(source)) {
-      for (const rendered of renderer.render(normalized.threadId, event)) {
-        yield output(rendered, eventId)
+  while (!mapper.isDone()) {
+    try {
+      const events = await streamSessionEvents(options, normalized.threadId, afterEventId)
+      for await (const source of events) {
+        const eventId = typeof source.eventId === 'number' ? source.eventId : undefined
+        if (eventId !== undefined) afterEventId = Math.max(afterEventId, eventId)
+        for (const event of mapper.process(source)) {
+          for (const rendered of renderer.render(normalized.threadId, event)) {
+            yield output(rendered, eventId)
+          }
+        }
+        if (mapper.isDone()) return
       }
+      break
+    } catch (error) {
+      if (reconnectAttempts >= streamReconnectAttempts(options)) {
+        throw error
+      }
+      reconnectAttempts += 1
+      options.logger?.warn('centaur_web_stream_reconnect', {
+        after_event_id: afterEventId,
+        attempt: reconnectAttempts,
+        error: errorMessage(error),
+        thread_id: normalized.threadId
+      })
+      yield output({ type: 'web.status.update', status: 'Reconnecting' })
+      await sleep(streamReconnectDelayMs(options))
     }
-    if (mapper.isDone()) return
   }
 
   for (const event of mapper.flush()) {
@@ -59,6 +83,24 @@ export async function* streamWebTurn(
       yield output(rendered)
     }
   }
+}
+
+function streamReconnectAttempts(options: CentaurWebOptions): number {
+  const value = options.streamReconnectAttempts ?? DEFAULT_STREAM_RECONNECT_ATTEMPTS
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_STREAM_RECONNECT_ATTEMPTS
+}
+
+function streamReconnectDelayMs(options: CentaurWebOptions): number {
+  const value = options.streamReconnectDelayMs ?? DEFAULT_STREAM_RECONNECT_DELAY_MS
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_STREAM_RECONNECT_DELAY_MS
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 export function toCodexInputLine(input: WebTurnRequest, messageId = newMessageId()): string {

@@ -13,6 +13,8 @@ export type CentaurWebOptions = {
   idleTimeoutMs?: number
   logger?: CentaurWebLogger
   maxDurationMs?: number
+  streamReconnectAttempts?: number
+  streamReconnectDelayMs?: number
 }
 
 export type CentaurWebLogger = {

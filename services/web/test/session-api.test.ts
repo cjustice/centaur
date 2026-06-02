@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
-import { parseSessionEventStream, toCodexInputLine } from '../src/session-api'
+import { parseSessionEventStream, streamWebTurn, toCodexInputLine } from '../src/session-api'
+import type { CentaurWebFetch } from '../src/types'
 
 describe('web session api helpers', () => {
   it('builds Codex app-server input lines for the Rust V2 session API', () => {
@@ -81,4 +82,101 @@ describe('web session api helpers', () => {
     expect(events[0]).toMatchObject({ eventId: 7, eventKind: 'session.output.line' })
     expect(events[1]).toMatchObject({ eventId: 8, eventKind: 'session.output.line' })
   })
+
+  it('reconnects session event streams from the last observed event id', async () => {
+    const requests: string[] = []
+    let eventStreamCalls = 0
+    const fetch: CentaurWebFetch = async (input, init) => {
+      const url = new URL(String(input))
+      requests.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`)
+      if (url.pathname.endsWith('/events')) {
+        eventStreamCalls += 1
+        return new Response(eventStreamCalls === 1 ? erroredEventStream() : terminalEventStream())
+      }
+      return new Response('{}', { status: 200 })
+    }
+
+    const outputs = []
+    for await (const item of streamWebTurn(
+      {
+        apiUrl: 'http://api.local',
+        fetch,
+        streamReconnectAttempts: 1,
+        streamReconnectDelayMs: 0
+      },
+      {
+        threadId: 'web:test-thread',
+        message: 'continue after disconnect'
+      }
+    )) {
+      outputs.push(item)
+    }
+
+    expect(requests).toContain('GET /api/session/web%3Atest-thread/events?after_event_id=0')
+    expect(requests).toContain('GET /api/session/web%3Atest-thread/events?after_event_id=8')
+    expect(outputs.map(item => item.output.type)).toContain('web.status.update')
+    expect(outputs).toContainEqual({
+      eventId: 11,
+      output: {
+        type: 'web.message.delta',
+        delta: 'Hello world',
+        force: true,
+        planPrefix: false
+      }
+    })
+    expect(outputs.at(-1)?.output).toMatchObject({
+      answerMarkdown: 'Hello world',
+      type: 'web.session.closed'
+    })
+  })
 })
+
+function erroredEventStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          [
+            'id: 7',
+            'event: session.output.line',
+            'data: {"type":"item.started","item":{"type":"agentMessage","id":"msg-1","text":"","phase":"final_answer"}}',
+            '',
+            'id: 8',
+            'event: session.output.line',
+            'data: {"type":"item.agentMessage.delta","itemId":"msg-1","delta":"Hello"}',
+            '',
+            ''
+          ].join('\n')
+        )
+      )
+      setTimeout(() => controller.error(new Error('network error')), 0)
+    }
+  })
+}
+
+function terminalEventStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          [
+            'id: 9',
+            'event: session.output.line',
+            'data: {"type":"item.agentMessage.delta","itemId":"msg-1","delta":" world"}',
+            '',
+            'id: 10',
+            'event: session.output.line',
+            'data: {"type":"item.completed","item":{"type":"agentMessage","id":"msg-1","text":"Hello world","phase":"final_answer"}}',
+            '',
+            'id: 11',
+            'event: session.output.line',
+            'data: {"type":"turn.completed"}',
+            '',
+            ''
+          ].join('\n')
+        )
+      )
+      controller.close()
+    }
+  })
+}
