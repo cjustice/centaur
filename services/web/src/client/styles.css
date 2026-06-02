@@ -314,19 +314,21 @@ input,
   box-shadow: none;
 }
 
-.thinking-panel {
+.task-list {
+  display: grid;
+  gap: 10px;
   align-self: flex-start;
   width: min(760px, 100%);
 }
 
-.thinking-panel details {
+.task-panel {
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: #171717;
 }
 
-.thinking-panel summary {
+.task-panel summary {
   display: flex;
   gap: 8px;
   align-items: center;
@@ -337,58 +339,65 @@ input,
   list-style: none;
 }
 
-.thinking-panel summary::-webkit-details-marker {
+.task-panel summary::-webkit-details-marker {
   display: none;
 }
 
-.thinking-dot {
+.task-dot {
+  flex: 0 0 auto;
   width: 6px;
   height: 6px;
   border-radius: 999px;
   background: var(--text-dim);
 }
 
-.thinking-dot.active {
+.task-dot.active {
   background: var(--text-muted);
 }
 
-.thinking-title {
+.task-title {
   min-width: 0;
+  overflow: hidden;
   color: var(--text);
   font-size: 13px;
   font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.thinking-status {
+.task-status {
   margin-left: auto;
   color: var(--text-dim);
   font-size: 12px;
+  white-space: nowrap;
 }
 
-.thinking-content {
+.task-content {
   display: grid;
   gap: 10px;
   padding: 0 11px 11px;
 }
 
-.thinking-content::before {
+.task-content::before {
   content: "";
   height: 1px;
   background: var(--border);
 }
 
-.thinking-item {
+.task-text,
+.task-output {
   min-width: 0;
 }
 
-.thinking-text p,
-.thinking-placeholder {
+.task-text p,
+.task-output p,
+.task-placeholder {
   color: var(--text-muted);
   font-size: 13px;
   line-height: 1.45;
 }
 
-.thinking-placeholder {
+.task-placeholder {
   margin: 0;
 }
 
@@ -547,7 +556,7 @@ pre {
   }
 
   .message.assistant,
-  .thinking-panel {
+  .task-list {
     max-width: 100%;
   }
 

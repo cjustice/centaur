@@ -16,12 +16,6 @@ type ThreadSummary = {
   title: string
 }
 
-type ThinkingItem = {
-  id: string
-  status: WebRendererTask['status']
-  text: string
-}
-
 type StreamEvent = {
   data: WebRendererOutput
   id?: number
@@ -40,7 +34,7 @@ export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>(() => [
     createThreadSummary(INITIAL_THREAD_ID)
   ])
-  const [thinkingItems, setThinkingItems] = useState<ThinkingItem[]>([])
+  const [taskItems, setTaskItems] = useState<WebRendererTask[]>([])
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
@@ -49,6 +43,7 @@ export function App() {
   const visibleThreads = searchQuery.trim()
     ? threads.filter(thread => threadMatchesSearch(thread, searchQuery))
     : threads
+  const displayedTasks = visibleTasks(taskItems)
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -75,7 +70,7 @@ export function App() {
     setInput('')
     setStreaming(true)
     setStatus('Starting')
-    setThinkingItems([])
+    setTaskItems([])
     updateThread(threadId, {
       lastMessage: message,
       status: 'Starting',
@@ -126,9 +121,7 @@ export function App() {
       return
     }
     if (output.type === 'web.task.upsert') {
-      if (isThinkingTask(output.task)) {
-        setThinkingItems(current => upsertThinkingItem(current, output.task))
-      }
+      setTaskItems(current => upsertTaskItem(current, output.task))
       return
     }
     if (output.type === 'web.plan.update') {
@@ -166,7 +159,7 @@ export function App() {
     setLastEventId(0)
     setStatus('Idle')
     setMessages([])
-    setThinkingItems([])
+    setTaskItems([])
     setSearchOpen(false)
     setSearchQuery('')
     assistantIdRef.current = null
@@ -178,7 +171,7 @@ export function App() {
     setLastEventId(0)
     setStatus(thread.status)
     setMessages([])
-    setThinkingItems([])
+    setTaskItems([])
     assistantIdRef.current = null
   }
 
@@ -266,13 +259,13 @@ export function App() {
         <div className="content-grid">
           <section className="conversation">
             <div className="message-list" aria-live="polite">
-              {thinkingItems.length > 0 && !assistantIdRef.current && (
-                <ThinkingPanel items={thinkingItems} streaming={streaming} />
+              {displayedTasks.length > 0 && !assistantIdRef.current && (
+                <TaskList tasks={displayedTasks} streaming={streaming} />
               )}
               {messages.map(message => (
                 <Fragment key={message.id}>
-                  {thinkingItems.length > 0 && message.id === assistantIdRef.current && (
-                    <ThinkingPanel items={thinkingItems} streaming={streaming} />
+                  {displayedTasks.length > 0 && message.id === assistantIdRef.current && (
+                    <TaskList tasks={displayedTasks} streaming={streaming} />
                   )}
                   <article className={`message ${message.role}`}>
                     <MarkdownText text={message.text || (message.role === 'assistant' ? '...' : '')} />
@@ -306,31 +299,39 @@ export function App() {
   )
 }
 
-function ThinkingPanel(props: { items: ThinkingItem[]; streaming: boolean }) {
-  const active = props.items.some(item => item.status === 'pending' || item.status === 'in_progress')
-  const summary = props.streaming || active ? 'Working' : 'Done'
+function TaskList(props: { tasks: WebRendererTask[]; streaming: boolean }) {
+  return (
+    <section className="task-list" aria-label="Model activity">
+      {props.tasks.map(task => (
+        <TaskPanel key={task.id} streaming={props.streaming} task={task} />
+      ))}
+    </section>
+  )
+}
+
+function TaskPanel(props: { task: WebRendererTask; streaming: boolean }) {
+  const active = isTaskActive(props.task)
+  const open = active || hasTaskBody(props.task)
 
   return (
-    <section className="thinking-panel" aria-label="Thinking">
-      <details open={active || props.streaming}>
-        <summary>
-          <span className={`thinking-dot ${active ? 'active' : ''}`} />
-          <span className="thinking-title">Thinking</span>
-          <span className="thinking-status">{summary}</span>
-        </summary>
-        <div className="thinking-content">
-          {props.items.map(item => (
-            <div className="thinking-item" key={item.id}>
-              {item.text ? (
-                <MarkdownText className="markdown-text thinking-text" text={item.text} />
-              ) : (
-                <p className="thinking-placeholder">Waiting for the first update...</p>
-              )}
-            </div>
-          ))}
-        </div>
-      </details>
-    </section>
+    <details className="task-panel" open={open}>
+      <summary>
+        <span className={`task-dot ${active ? 'active' : ''}`} />
+        <span className="task-title">{props.task.title}</span>
+        <span className="task-status">{taskStatusLabel(props.task, props.streaming)}</span>
+      </summary>
+      <div className="task-content">
+        {props.task.details && (
+          <MarkdownText className="markdown-text task-text" text={props.task.details} />
+        )}
+        {props.task.output && (
+          <MarkdownText className="markdown-text task-output" text={props.task.output} />
+        )}
+        {!hasTaskBody(props.task) && active && (
+          <p className="task-placeholder">Waiting for the first update...</p>
+        )}
+      </div>
+    </details>
   )
 }
 
@@ -390,20 +391,37 @@ function threadMatchesSearch(thread: ThreadSummary, query: string): boolean {
   )
 }
 
-function isThinkingTask(task: WebRendererTask): boolean {
-  return task.title.trim().toLowerCase() === 'thinking'
+function upsertTaskItem(items: WebRendererTask[], task: WebRendererTask): WebRendererTask[] {
+  const existingIndex = items.findIndex(item => item.id === task.id)
+  if (existingIndex === -1) return [...items, task]
+  return items.map((item, index) =>
+    index === existingIndex
+      ? {
+          ...item,
+          ...task,
+          details: task.details ?? item.details,
+          output: task.output ?? item.output
+        }
+      : item
+  )
 }
 
-function upsertThinkingItem(items: ThinkingItem[], task: WebRendererTask): ThinkingItem[] {
-  const text = [task.details, task.output].filter(Boolean).join('\n\n')
-  const next: ThinkingItem = {
-    id: task.id,
-    status: task.status,
-    text
-  }
-  const existingIndex = items.findIndex(item => item.id === task.id)
-  if (existingIndex === -1) return [...items, next]
-  return items.map((item, index) => (index === existingIndex ? next : item))
+function visibleTasks(tasks: WebRendererTask[]): WebRendererTask[] {
+  return tasks.filter(task => hasTaskBody(task) || isTaskActive(task))
+}
+
+function hasTaskBody(task: WebRendererTask): boolean {
+  return Boolean(task.details?.trim() || task.output?.trim())
+}
+
+function isTaskActive(task: WebRendererTask): boolean {
+  return task.status === 'pending' || task.status === 'in_progress'
+}
+
+function taskStatusLabel(task: WebRendererTask, streaming: boolean): string {
+  if (task.status === 'error') return 'Error'
+  if (isTaskActive(task)) return streaming ? 'Working' : 'Pending'
+  return 'Done'
 }
 
 async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncIterable<StreamEvent> {
