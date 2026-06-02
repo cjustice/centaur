@@ -6,6 +6,7 @@ export {
   rustSessionEventToServerNotification
 } from './codex-app-server'
 export { ChatSDKRenderer } from './chat-sdk'
+export { WebRenderer } from './web'
 export type { CodexAppServerToChatStreamOptions } from './codex-app-server'
 export type { RendererInterface, RendererSession } from './interface'
 export { rendererEventTypes } from './schema'
@@ -18,6 +19,7 @@ export type {
   ChatSDKMessageUpsert,
   ChatSDKSessionClosed
 } from './chat-sdk'
+export type { WebRendererOutput, WebRendererTask } from './web'
 export type {
   RendererEvent,
   RendererLogInfo,

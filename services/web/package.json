@@ -1,0 +1,31 @@
+{
+  "name": "centaur-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0",
+    "start": "bun src/server.ts",
+    "test": "bun test test",
+    "check:types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@centaur/harness-events": "workspace:*",
+    "@centaur/rendering": "workspace:*",
+    "hono": "^4.12.18",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "regen-ui": "^0.5.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.13",
+    "@types/node": "^25.7.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.0"
+  }
+}

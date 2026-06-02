@@ -46,6 +46,22 @@ spec:
       targetPort: 3001
 ---
 {{- end }}
+{{- if .Values.web.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "web") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "web") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3003
+      targetPort: 3003
+---
+{{- end }}
 {{- if .Values.runnerAccess.enabled }}
 apiVersion: v1
 kind: Service

@@ -293,6 +293,18 @@ slackbotv2:
   extraEnv: {}
   resources: {}
 
+web:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-web
+    tag: latest
+    pullPolicy: Always
+  idleTimeoutMs: ""
+  maxDurationMs: ""
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:

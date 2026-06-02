@@ -21,10 +21,6 @@ slackbotv2:
   image:
     pullPolicy: IfNotPresent
 
-apiRs:
-  image:
-    pullPolicy: IfNotPresent
-
 api:
   image:
     pullPolicy: IfNotPresent
@@ -33,18 +29,30 @@ api:
   egressDiscovery:
     enabled: false
 
+apiRs:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+
+web:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+
 ironProxy:
   image:
     pullPolicy: IfNotPresent
-  manager:
-    secretSource: onepassword
+  secretSource: env
 
 tokenBroker:
-  enabled: true
+  enabled: false
 
 sandbox:
   image:
     pullPolicy: IfNotPresent
+
+agentSandbox:
+  enabled: true
 
 # Run the tool-server sidecar by default in dev so local clusters mirror
 # production sandbox topology.

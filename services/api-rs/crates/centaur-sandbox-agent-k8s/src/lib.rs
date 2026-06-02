@@ -545,6 +545,12 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
                     "path": source_path,
                 },
             }),
+            MountKind::Secret { secret_name } => json!({
+                "name": name,
+                "secret": {
+                    "secretName": secret_name,
+                },
+            }),
         });
     }
     (volumes, mounts)
@@ -632,6 +638,12 @@ mod tests {
             .args(["cat"])
             .env("CENTAUR_API_URL", "http://api:8000")
             .mount(centaur_sandbox_core::Mount::new(
+                MountKind::Secret {
+                    secret_name: "centaur-firewall-ca".to_owned(),
+                },
+                "/firewall-certs",
+            ))
+            .mount(centaur_sandbox_core::Mount::new(
                 MountKind::EmptyDir,
                 "/workspace",
             ))
@@ -658,7 +670,16 @@ mod tests {
         let container = &sandbox.spec.pod_template.spec.containers[0];
         assert_eq!(container.image.as_deref(), Some("centaur-agent:latest"));
         assert_eq!(container.stdin, Some(true));
-        assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
+        assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 3);
+        let volumes = sandbox.spec.pod_template.spec.volumes.as_ref().unwrap();
+        assert_eq!(
+            volumes[0].secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("centaur-firewall-ca")
+        );
+        let volume_mounts = container.volume_mounts.as_ref().unwrap();
+        assert_eq!(volume_mounts[0].mount_path, "/firewall-certs");
+        assert_eq!(volume_mounts[1].mount_path, "/workspace");
+        assert_eq!(volume_mounts[2].mount_path, "/home/agent/state");
         assert!(container.resources.as_ref().unwrap().limits.is_some());
     }
 

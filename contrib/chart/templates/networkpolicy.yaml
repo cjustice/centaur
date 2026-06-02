@@ -106,6 +106,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
 {{- end }}
+{{- if .Values.web.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "web") | nindent 14 }}
+{{- end }}
         # Sandboxes call back into the control plane. agent-k8s labels its pods
         # centaur.ai/managed-by=api-rs (MANAGED_BY_VALUE in centaur-sandbox-agent-k8s),
         # which also covers the per-sandbox iron-proxy pods.
@@ -236,6 +241,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.apiRs.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+{{- end }}
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "iron-proxy") | nindent 14 }}
@@ -296,6 +306,39 @@ spec:
     - ports:
         - protocol: TCP
           port: {{ .Values.networkPolicy.apiServerPort }}
+---
+{{- if .Values.web.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "web") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "web") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3003
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
 ---
 {{- end }}
 {{- if .Values.slackbot.enabled }}
@@ -382,6 +425,11 @@ spec:
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.apiRs.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
 {{- end }}
         - podSelector:
             matchLabels:
@@ -548,4 +596,12 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+    - to:
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+              centaur.ai/sandbox-id: api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.proxyPort }}
 {{- end }}

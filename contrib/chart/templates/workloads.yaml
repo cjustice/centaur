@@ -459,6 +459,74 @@ spec:
                 path: services/sandbox/SYSTEM_PROMPT.md
 {{- end }}
 ---
+{{- if .Values.web.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "web") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  replicas: {{ .Values.web.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "web") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret-env: {{ toJson (dict "secretManager" .Values.secretManager "firewallCa" .Values.firewall.ca) | sha256sum }}
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "web") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: web
+          image: {{ printf "%s:%s" .Values.web.image.repository .Values.web.image.tag | quote }}
+          imagePullPolicy: {{ .Values.web.image.pullPolicy }}
+          env:
+            - name: CENTAUR_API_RS_URL
+              value: {{ printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "api-rs")) .Values.apiRs.port | quote }}
+            - name: CENTAUR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
+{{- if .Values.web.idleTimeoutMs }}
+            - name: SESSION_IDLE_TIMEOUT_MS
+              value: {{ .Values.web.idleTimeoutMs | quote }}
+{{- end }}
+{{- if .Values.web.maxDurationMs }}
+            - name: SESSION_MAX_DURATION_MS
+              value: {{ .Values.web.maxDurationMs | quote }}
+{{- end }}
+{{- range $name, $value := .Values.web.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+          ports:
+            - containerPort: 3003
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3003
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3003
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.web.resources | nindent 12 }}
+---
 {{- end }}
 {{- if .Values.slackbot.enabled }}
 apiVersion: apps/v1

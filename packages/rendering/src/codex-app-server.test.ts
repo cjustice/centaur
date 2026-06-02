@@ -450,6 +450,27 @@ describe('CodexAppServerRendererEventMapper', () => {
       error: 'sandbox exited'
     })
   })
+
+  it('maps Codex turn.failed output lines to renderer errors', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+
+    const events = mapper.process({
+      eventKind: 'session.output.line',
+      data: JSON.stringify({
+        type: 'turn.failed',
+        error: {
+          message: 'Reconnecting... 2/5',
+          additionalDetails: 'unexpected status 401 Unauthorized'
+        }
+      })
+    })
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'renderer.done',
+      error: 'Reconnecting... 2/5\nunexpected status 401 Unauthorized'
+    })
+    expect(mapper.isDone()).toBe(true)
+  })
 })
 
 function plain(elements: RendererTaskBlock[] | undefined): string {
