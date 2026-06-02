@@ -29,13 +29,19 @@ export function App() {
   const [status, setStatus] = useState('Idle')
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
   const [threads, setThreads] = useState<ThreadSummary[]>(() => [
     createThreadSummary(INITIAL_THREAD_ID)
   ])
   const [streaming, setStreaming] = useState(false)
   const assistantIdRef = useRef<string | null>(null)
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const activeThread = threads.find(thread => thread.id === threadId) ?? threads[0]
   const title = activeThread?.title ?? 'New chat'
+  const visibleThreads = searchQuery.trim()
+    ? threads.filter(thread => threadMatchesSearch(thread, searchQuery))
+    : threads
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -50,6 +56,11 @@ export function App() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
+
+  useEffect(() => {
+    if (!searchOpen) return
+    searchInputRef.current?.focus()
+  }, [searchOpen])
 
   async function submit() {
     const message = input.trim()
@@ -144,6 +155,8 @@ export function App() {
     setLastEventId(0)
     setStatus('Idle')
     setMessages([])
+    setSearchOpen(false)
+    setSearchQuery('')
     assistantIdRef.current = null
   }
 
@@ -176,14 +189,37 @@ export function App() {
             <span>New chat</span>
             <kbd>⌘N</kbd>
           </button>
-          <button className="sidebar-action" type="button">
+          <button
+            aria-expanded={searchOpen}
+            className={`sidebar-action ${searchOpen ? 'active' : ''}`}
+            onClick={() => setSearchOpen(true)}
+            type="button"
+          >
             <Search size={20} />
             <span>Search</span>
           </button>
         </nav>
 
+        {searchOpen && (
+          <div className="thread-search">
+            <Search size={16} />
+            <input
+              aria-label="Search threads"
+              onChange={event => setSearchQuery(event.target.value)}
+              onKeyDown={event => {
+                if (event.key !== 'Escape') return
+                setSearchQuery('')
+                setSearchOpen(false)
+              }}
+              placeholder="Search threads"
+              ref={searchInputRef}
+              value={searchQuery}
+            />
+          </div>
+        )}
+
         <nav className="thread-list" aria-label="Threads">
-          {threads.map(thread => (
+          {visibleThreads.map(thread => (
             <button
               className={`thread-item ${thread.id === threadId ? 'active' : ''}`}
               disabled={streaming}
@@ -196,6 +232,7 @@ export function App() {
               {thread.lastMessage && <span className="thread-preview">{thread.lastMessage}</span>}
             </button>
           ))}
+          {visibleThreads.length === 0 && <div className="thread-empty">No threads found</div>}
         </nav>
       </aside>
 
@@ -294,6 +331,14 @@ function createThreadSummary(threadId: string): ThreadSummary {
 function threadTitleFromMessage(message: string): string {
   const trimmed = message.trim().replace(/\s+/g, ' ')
   return trimmed.length > 42 ? `${trimmed.slice(0, 39)}...` : trimmed || 'New chat'
+}
+
+function threadMatchesSearch(thread: ThreadSummary, query: string): boolean {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return true
+  return [thread.title, thread.id, thread.lastMessage].some(value =>
+    value.toLowerCase().includes(needle)
+  )
 }
 
 async function* parseSse(stream: ReadableStream<Uint8Array>): AsyncIterable<StreamEvent> {

@@ -89,6 +89,11 @@ input,
   background: #282828;
 }
 
+.sidebar-action.active {
+  background: #282828;
+  color: #f2f2f2;
+}
+
 .sidebar-action.primary:hover {
   background: #363636;
 }
@@ -120,6 +125,30 @@ input,
   font-weight: 700;
   line-height: 1.35;
   text-align: center;
+}
+
+.thread-search {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  background: #202020;
+  color: var(--text-muted);
+}
+
+.thread-search input {
+  min-width: 0;
+  border: 0 !important;
+  outline: 0;
+  background: transparent !important;
+  color: var(--text) !important;
+}
+
+.thread-search input::placeholder {
+  color: var(--text-dim);
 }
 
 .thread-list {
@@ -182,6 +211,12 @@ input,
 .thread-preview {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.thread-empty {
+  padding: 8px 10px;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 
 .workspace {
