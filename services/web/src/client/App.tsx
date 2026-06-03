@@ -80,7 +80,7 @@ export function App() {
     setMessages(current => [...current, userMessage, assistantMessage])
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch('api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ threadId, message, afterEventId: lastEventId })

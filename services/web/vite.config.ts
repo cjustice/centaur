@@ -3,6 +3,7 @@ import regen from 'regen-ui/vite'
 import { defineConfig } from 'vite'
 
 export default defineConfig({
+  base: './',
   plugins: [regen(), react()],
   build: {
     outDir: 'dist/client',

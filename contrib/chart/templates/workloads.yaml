@@ -509,9 +509,6 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
 {{- end }}
-          envFrom:
-            - secretRef:
-                name: {{ include "centaur.secretEnvName" . }}
           ports:
             - containerPort: 3003
               name: http

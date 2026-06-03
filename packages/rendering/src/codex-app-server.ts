@@ -330,17 +330,13 @@ export class CodexAppServerRendererEventMapper
         output: []
       })
     }
-    if (!this.state.answerText.trim()) {
-      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
-      recomposeBuffers(this.state)
-    }
     this.emitActivitySummary(out, { final: true })
     this.emitPendingAssistantText(out, { force: true })
+    const answerMarkdown = this.state.answerText.trim() ? this.state.answerText : undefined
     out.push({
       type: 'renderer.done',
-      answerMarkdown: this.state.answerText,
+      ...(answerMarkdown ? { answerMarkdown, streamFinalUpdates: true } : {}),
       error,
-      streamFinalUpdates: true,
       threadId: this.state.threadId || undefined
     })
     return out
@@ -724,7 +720,7 @@ function messageFromError(error: any, message: unknown, fallback: string): strin
     const message = typeof error.message === 'string' ? error.message : ''
     const details =
       typeof error.additionalDetails === 'string' ? error.additionalDetails : ''
-    if (message && details && !message.includes(details)) return `${message}: ${details}`
+    if (message && details && !message.includes(details)) return `${message}\n${details}`
     if (message) return message
     if (details) return details
   }
