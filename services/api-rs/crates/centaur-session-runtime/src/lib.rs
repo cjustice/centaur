@@ -33,7 +33,8 @@ pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 const MAX_SESSION_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync>;
+type SandboxSpecFactory =
+    Arc<dyn Fn(&ThreadKey, &str, &HarnessType, Option<&str>) -> SandboxSpec + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 
 #[derive(Clone)]
@@ -122,6 +123,7 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
+        persona_id: Option<&str>,
         metadata: Option<Value>,
     ) -> Result<Session, SessionRuntimeError> {
         // Read slack_user_id before `metadata` is consumed below; it keys the
@@ -133,7 +135,12 @@ impl SessionRuntime {
             .map(ToOwned::to_owned);
         let session = self
             .store
-            .create_or_get_session(thread_key, harness_type, default_metadata(metadata))
+            .create_or_get_session(
+                thread_key,
+                harness_type,
+                persona_id,
+                default_metadata(metadata),
+            )
             .await?;
         if let Some(registrar) = &self.iron_control {
             // iron-control is the source of truth for the session's egress
@@ -151,6 +158,13 @@ impl SessionRuntime {
                 .await?);
         }
         Ok(session)
+    }
+
+    pub async fn get_session(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Session, SessionRuntimeError> {
+        Ok(self.store.get_session(thread_key).await?)
     }
 
     pub async fn append_messages(
@@ -197,6 +211,13 @@ impl SessionRuntime {
         Ok(report)
     }
 
+    pub async fn list_messages(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Vec<centaur_session_core::SessionMessage>, SessionRuntimeError> {
+        Ok(self.store.list_messages(thread_key).await?)
+    }
+
     pub async fn execute_session(
         &self,
         thread_key: &ThreadKey,
@@ -230,6 +251,8 @@ impl SessionRuntime {
                 session.sandbox_id.as_deref(),
                 session.iron_control_principal.as_deref(),
                 &execution.execution_id,
+                &session.harness_type,
+                session.persona_id.as_deref(),
             )
             .await?;
 
@@ -242,6 +265,7 @@ impl SessionRuntime {
                     "execution_id": execution.execution_id,
                     "thread_key": thread_key.as_str(),
                     "input_line_count": input.input_lines.len(),
+                    "metadata": execution.metadata.clone(),
                 }),
             )
             .await?;
@@ -285,6 +309,7 @@ impl SessionRuntime {
                     "execution_id": execution.execution_id,
                     "thread_key": thread_key.as_str(),
                     "completion_reason": "input_accepted",
+                    "metadata": execution.metadata.clone(),
                 }),
             )
             .await?;
@@ -292,6 +317,37 @@ impl SessionRuntime {
         Ok(self
             .store
             .complete_execution(&execution.execution_id)
+            .await?)
+    }
+
+    pub async fn append_thread_title_update(
+        &self,
+        thread_key: &ThreadKey,
+        title: &str,
+        metadata: Option<Value>,
+    ) -> Result<SessionEvent, SessionRuntimeError> {
+        self.store.get_session(thread_key).await?;
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "title must not be empty".to_owned(),
+            ));
+        }
+        Ok(self
+            .store
+            .append_event(
+                thread_key,
+                None,
+                SESSION_OUTPUT_LINE_EVENT,
+                Value::String(
+                    json!({
+                        "type": "thread/name/updated",
+                        "name": title,
+                        "metadata": default_metadata(metadata),
+                    })
+                    .to_string(),
+                ),
+            )
             .await?)
     }
 
@@ -318,12 +374,27 @@ impl SessionRuntime {
         ))
     }
 
+    pub async fn list_events_after(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        self.store.get_session(thread_key).await?;
+        Ok(self
+            .store
+            .list_events_after(thread_key, after_event_id, limit)
+            .await?)
+    }
+
     async fn ensure_session_sandbox(
         &self,
         thread_key: &ThreadKey,
         existing_sandbox_id: Option<&str>,
         iron_control_principal: Option<&str>,
         execution_id: &str,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
     ) -> Result<String, SessionRuntimeError> {
         if let Some(sandbox_id) = existing_sandbox_id {
             let id = SandboxId::new(sandbox_id);
@@ -336,7 +407,8 @@ impl SessionRuntime {
             }
         }
 
-        let mut spec = (self.sandbox_runtime.spec_factory)(thread_key, execution_id);
+        let mut spec =
+            (self.sandbox_runtime.spec_factory)(thread_key, execution_id, harness_type, persona_id);
         if let Some(principal) = iron_control_principal {
             spec.iron_control_principal = Some(principal.to_owned());
         }
@@ -414,7 +486,11 @@ impl SessionRuntime {
 
 impl SandboxRuntime {
     pub fn backend(backend: Arc<dyn SandboxBackend>, spec: SandboxSpec) -> Self {
-        let spec_factory = move |_thread_key: &ThreadKey, _execution_id: &str| spec.clone();
+        let spec_factory =
+            move |_thread_key: &ThreadKey,
+                  _execution_id: &str,
+                  _harness_type: &HarnessType,
+                  _persona_id: Option<&str>| { spec.clone() };
         Self::backend_with_spec_factory(backend, spec_factory)
     }
 
@@ -422,14 +498,17 @@ impl SandboxRuntime {
         backend: Arc<dyn SandboxBackend>,
         workload: SandboxWorkloadMode,
     ) -> Self {
-        Self::backend_with_spec_factory(backend, move |thread_key, _execution_id| {
-            workload.spec(thread_key)
-        })
+        Self::backend_with_spec_factory(
+            backend,
+            move |thread_key, _execution_id, harness_type, persona_id| {
+                workload.spec(thread_key, harness_type, persona_id)
+            },
+        )
     }
 
     pub fn backend_with_spec_factory<F>(backend: Arc<dyn SandboxBackend>, spec_factory: F) -> Self
     where
-        F: Fn(&ThreadKey, &str) -> SandboxSpec + Send + Sync + 'static,
+        F: Fn(&ThreadKey, &str, &HarnessType, Option<&str>) -> SandboxSpec + Send + Sync + 'static,
     {
         Self {
             manager: Arc::new(SandboxManager::new(backend)),
@@ -466,14 +545,24 @@ impl SandboxWorkloadMode {
         self
     }
 
-    fn spec(&self, thread_key: &ThreadKey) -> SandboxSpec {
+    fn spec(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+    ) -> SandboxSpec {
         let spec = match self {
             Self::MockAppServer { image, .. } => SandboxSpec::new(image)
                 .command(["/bin/sh", "-lc"])
                 .args([mock_app_server_script()]),
             Self::CodexAppServer { image, env, .. } => {
-                let mut spec =
-                    SandboxSpec::new(image).env("CENTAUR_THREAD_KEY", thread_key.as_str());
+                let mut spec = SandboxSpec::new(image)
+                    .args([harness_wrapper(harness_type)])
+                    .env("CENTAUR_THREAD_KEY", thread_key.as_str())
+                    .env("CENTAUR_HARNESS_TYPE", harness_type.as_ref());
+                if let Some(persona_id) = persona_id {
+                    spec = spec.env("AGENT_PERSONA", persona_id);
+                }
                 for (name, value) in env {
                     spec = spec.env(name.clone(), value.clone());
                 }
@@ -488,6 +577,14 @@ impl SandboxWorkloadMode {
             spec = spec.mount(mount.clone());
         }
         spec
+    }
+}
+
+fn harness_wrapper(harness_type: &HarnessType) -> &'static str {
+    match harness_type {
+        HarnessType::Codex => "codex-app-wrapper",
+        HarnessType::Amp => "amp-wrapper",
+        HarnessType::ClaudeCode => "claude-app-wrapper",
     }
 }
 
@@ -713,7 +810,7 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let spec = workload.spec(&thread_key);
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, None);
 
         assert_eq!(spec.mounts.len(), 1);
         assert_eq!(spec.mounts[0].target_path, "/home/agent/github");
@@ -724,6 +821,38 @@ mod tests {
                 source_path: "/host/github".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn codex_app_workload_selects_wrapper_from_session_harness() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("CENTAUR_API_URL".to_owned(), "http://api:8000".to_owned())],
+        );
+        let thread_key = ThreadKey::parse("web:test-thread").unwrap();
+
+        for (harness_type, expected_wrapper, expected_wire_value) in [
+            (HarnessType::Codex, "codex-app-wrapper", "codex"),
+            (HarnessType::ClaudeCode, "claude-app-wrapper", "claudecode"),
+            (HarnessType::Amp, "amp-wrapper", "amp"),
+        ] {
+            let spec = workload.spec(&thread_key, &harness_type, Some("eng"));
+
+            assert_eq!(spec.args, vec![expected_wrapper]);
+            assert!(
+                spec.env
+                    .iter()
+                    .any(|env| env.name == "CENTAUR_THREAD_KEY" && env.value == "web:test-thread")
+            );
+            assert!(spec.env.iter().any(|env| {
+                env.name == "CENTAUR_HARNESS_TYPE" && env.value == expected_wire_value
+            }));
+            assert!(
+                spec.env
+                    .iter()
+                    .any(|env| env.name == "AGENT_PERSONA" && env.value == "eng")
+            );
+        }
     }
 }
 

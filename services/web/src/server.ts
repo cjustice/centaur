@@ -3,6 +3,7 @@ import type { CentaurWebLogger, CentaurWebOptions } from './types'
 
 const port = numberEnv('PORT', 3003)
 const apiUrl = stringEnv('CENTAUR_API_RS_URL', stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080'))
+const controlApiUrl = optionalEnv('CENTAUR_CONTROL_API_URL') ?? optionalEnv('CENTAUR_API_URL')
 
 const consoleLogger: CentaurWebLogger = {
   info: (event, fields) => log('info', event, fields),
@@ -13,6 +14,7 @@ const consoleLogger: CentaurWebLogger = {
 const options: CentaurWebOptions = {
   apiUrl,
   apiKey: optionalEnv('CENTAUR_API_KEY') ?? optionalEnv('SLACKBOT_API_KEY'),
+  controlApiUrl,
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
   streamReconnectAttempts: optionalNumberEnv('SESSION_STREAM_RECONNECT_ATTEMPTS'),
@@ -33,7 +35,8 @@ console.log(
     event: 'centaur_web_started',
     service: 'centaur-web',
     port: server.port,
-    api_url: apiUrl
+    api_url: apiUrl,
+    control_api_url: controlApiUrl
   })
 )
 

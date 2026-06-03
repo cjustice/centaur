@@ -1,15 +1,67 @@
 import { Hono } from 'hono'
 import { serveStatic } from 'hono/bun'
-import { streamWebTurn } from './session-api'
+import {
+  generateMissingWebThreadTitle,
+  loadWebPersonas,
+  loadWebThread,
+  streamWebTurn
+} from './session-api'
 import type { CentaurWebOptions, WebTurnRequest, WebTurnStreamItem } from './types'
 
 const encoder = new TextEncoder()
+const WEB_THREAD_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export function createCentaurWebApp(options: CentaurWebOptions): Hono {
   const app = new Hono()
 
   app.get('/health', c => c.json({ ok: true }))
   app.get('/healthz', c => c.json({ ok: true }))
+
+  app.get('/api/personas', async c => {
+    const personas = await loadWebPersonas(options)
+    return c.json({ personas })
+  })
+
+  app.get('/api/threads/:thread_uuid', async c => {
+    const threadUuid = c.req.param('thread_uuid').trim()
+    if (!WEB_THREAD_UUID_PATTERN.test(threadUuid)) {
+      return c.json({ error: 'Invalid thread UUID' }, 400)
+    }
+
+    try {
+      const thread = await loadWebThread(options, `web:${threadUuid}`)
+      if (!thread) return c.json({ error: 'Thread not found' }, 404)
+      return c.json(thread)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      options.logger?.error('centaur_web_thread_load_failed', {
+        error: message,
+        thread_id: `web:${threadUuid}`
+      })
+      return c.json({ error: message }, 502)
+    }
+  })
+
+  app.post('/api/threads/:thread_uuid/title', async c => {
+    const threadUuid = c.req.param('thread_uuid').trim()
+    if (!WEB_THREAD_UUID_PATTERN.test(threadUuid)) {
+      return c.json({ error: 'Invalid thread UUID' }, 400)
+    }
+
+    try {
+      const title = await generateMissingWebThreadTitle(options, `web:${threadUuid}`)
+      if (!title) return c.json({ error: 'Thread not found or has no messages' }, 404)
+      return c.json(title)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      options.logger?.error('centaur_web_thread_title_failed', {
+        error: message,
+        thread_id: `web:${threadUuid}`
+      })
+      return c.json({ error: message }, 502)
+    }
+  })
 
   app.post('/api/chat', async c => {
     let input: WebTurnRequest

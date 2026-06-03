@@ -1,13 +1,17 @@
 use axum::response::sse::Event;
-use centaur_session_core::{HarnessType, SessionEvent, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    HarnessType, SessionEvent, SessionMessage, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     pub harness_type: HarnessType,
+    pub persona_id: Option<String>,
     pub metadata: Option<Value>,
 }
 
@@ -20,6 +24,11 @@ pub struct AppendMessagesRequest {
 pub struct AppendMessagesResponse {
     pub ok: bool,
     pub message_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ListMessagesResponse {
+    pub messages: Vec<SessionMessage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,10 +49,43 @@ pub struct ExecuteSessionResponse {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SetSessionTitleRequest {
+    pub title: String,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SetSessionTitleResponse {
+    pub ok: bool,
+    pub event: SessionEvent,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct EventsQuery {
     pub after_event_id: Option<i64>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct EventLogQuery {
+    pub after_event_id: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ListEventsResponse {
+    pub events: Vec<SessionEvent>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PersonaRecord {
+    pub description: String,
+    pub engine: String,
+    pub default_repo: Option<String>,
+    pub has_custom_executor: bool,
+}
+
+pub type ListPersonasResponse = BTreeMap<String, PersonaRecord>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEventName {
