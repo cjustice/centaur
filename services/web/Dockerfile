@@ -25,6 +25,7 @@ COPY --from=builder /repo/node_modules ./node_modules
 COPY --from=builder /repo/packages/harness-events ./packages/harness-events
 COPY --from=builder /repo/packages/rendering ./packages/rendering
 COPY --from=builder /repo/services/web ./services/web
+COPY docs/public/brand/ ./services/web/dist/client/brand/
 
 WORKDIR /repo/services/web
 

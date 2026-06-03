@@ -81,7 +81,8 @@ export function createCentaurWebApp(options: CentaurWebOptions): Hono {
   })
 
   app.use('/assets/*', serveStatic({ root: './dist/client' }))
-  app.get('/favicon.svg', serveStatic({ path: './dist/client/favicon.svg' }))
+  app.use('/brand/*', serveStatic({ root: './dist/client' }))
+  app.get('/favicon.svg', serveStatic({ path: './dist/client/brand/mark-white.svg' }))
   app.get('*', serveStatic({ path: './dist/client/index.html' }))
 
   return app

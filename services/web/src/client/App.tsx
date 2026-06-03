@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
-import { ArrowUp, Bot } from 'lucide-react'
+import { ArrowUp } from 'lucide-react'
 import { Select } from 'regen-ui'
 import type { WebRendererOutput, WebRendererTask } from '@centaur/rendering'
 import type { LoadedWebThread, WebPersonaOption } from '../types'
@@ -481,7 +481,10 @@ export function App() {
             type="button"
           >
             <span>New chat</span>
-            <kbd>⌘N</kbd>
+            <kbd aria-label="Command N">
+              <span>⌘</span>
+              <span>N</span>
+            </kbd>
           </button>
         </nav>
 
@@ -508,7 +511,7 @@ export function App() {
             <h1>{title}</h1>
             {status !== 'Idle' && (
               <p className="topbar-status">
-                {status} · Events {lastEventId}
+                {status} · Event #{lastEventId}
               </p>
             )}
           </div>
@@ -580,7 +583,8 @@ const Composer = (props: {
           value={props.input}
         />
         <div className="composer-controls">
-          <div className="composer-control-group">
+          <div className="composer-control-spacer" aria-hidden="true" />
+          <div className="composer-control-group align-end">
             <DropdownPill
               label="Model"
               onChange={props.onHarnessTypeChange}
@@ -588,14 +592,12 @@ const Composer = (props: {
               value={props.harnessType}
             />
             <DropdownPill
-              icon="bot"
               label="Persona"
               onChange={props.onPersonaIdChange}
               options={props.personaOptions}
+              prefix="Persona:"
               value={props.personaId}
             />
-          </div>
-          <div className="composer-control-group align-end">
             <button
               aria-label="Send message"
               className="composer-send"
@@ -612,23 +614,23 @@ const Composer = (props: {
 }
 
 function DropdownPill(props: {
-  icon?: 'bot'
   label: string
   onChange: (value: string) => void
   options: Array<{ label: string; value: string }>
+  prefix?: string
   value: string
 }) {
   return (
     <div className="dropdown-pill">
-      {props.icon === 'bot' && (
-        <Bot aria-hidden="true" className="dropdown-pill-icon" size={16} />
-      )}
       <Select
         aria-label={props.label}
         className="dropdown-pill-select"
         items={props.options.map(option => ({
           label: option.label,
-          textValue: option.label,
+          prefix: props.prefix ? (
+            <span className="dropdown-pill-prefix">{props.prefix}</span>
+          ) : undefined,
+          textValue: props.prefix ? `${props.prefix} ${option.label}` : option.label,
           value: option.value
         }))}
         onChange={props.onChange}

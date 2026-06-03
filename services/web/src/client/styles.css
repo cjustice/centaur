@@ -173,9 +173,13 @@ textarea,
 }
 
 .sidebar-action kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   justify-self: end;
-  width: 34px;
-  min-width: 34px;
+  width: 40px;
+  min-width: 40px;
   padding: 2px 0;
   border: 0;
   border-radius: 999px;
@@ -502,7 +506,12 @@ pre {
   display: flex;
   gap: 14px;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.composer-control-spacer {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -514,6 +523,8 @@ pre {
 }
 
 .composer-control-group.align-end {
+  flex: 0 1 auto;
+  margin-left: auto;
   justify-content: flex-end;
 }
 
@@ -557,9 +568,11 @@ pre {
   color: #d7d7d7;
 }
 
-.dropdown-pill-icon {
+.dropdown-pill-prefix {
   flex: 0 0 auto;
   color: #a8a8a8;
+  font-size: 14px;
+  line-height: 1.35;
 }
 
 .dropdown-pill-select {
@@ -607,21 +620,38 @@ pre {
 
 @media (max-width: 900px) {
   .app-shell {
+    display: block;
+    padding-top: 74px;
     grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
     min-height: 100dvh;
   }
 
+  .landing-shell {
+    padding-top: 0;
+  }
+
   .sidebar {
+    position: fixed;
+    z-index: 30;
+    top: calc(8px + env(safe-area-inset-top));
+    right: 8px;
+    left: 8px;
+    display: grid;
+    grid-template-columns: minmax(150px, 240px) minmax(0, 1fr);
     gap: 10px;
+    align-items: center;
     padding: 8px;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
+    border: 1px solid var(--border);
+    border-radius: 12px !important;
+    background: rgba(27, 27, 27, 0.94);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+    backdrop-filter: blur(16px);
   }
 
   .sidebar-actions {
-    grid-template-columns: minmax(0, 340px);
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
+    min-width: 0;
   }
 
   .sidebar-action {
@@ -634,8 +664,9 @@ pre {
   }
 
   .sidebar-action kbd {
-    min-width: 34px;
-    padding: 2px 7px;
+    width: 38px;
+    min-width: 38px;
+    padding: 2px 0;
     font-size: 11px;
   }
 
@@ -643,6 +674,7 @@ pre {
     flex: 0 0 auto;
     flex-direction: row;
     gap: 6px;
+    min-width: 0;
     overflow-x: auto;
     padding-bottom: 2px;
     scrollbar-width: none;
@@ -669,6 +701,7 @@ pre {
   }
 
   .workspace {
+    height: calc(100dvh - 74px);
     min-height: 0;
   }
 
@@ -738,6 +771,12 @@ pre {
 
   .composer-controls {
     align-items: flex-end;
+    justify-content: flex-end;
+  }
+
+  .composer-control-group.align-end {
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .dropdown-pill-select {
@@ -789,6 +828,10 @@ pre {
 
   .composer-control-group {
     gap: 8px;
+  }
+
+  .dropdown-pill-prefix {
+    font-size: 13px;
   }
 
   .dropdown-pill-select {
