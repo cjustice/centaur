@@ -223,6 +223,10 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "webIngressSourceNamespaces": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "apiIngressSourceNamespaces": {
           "type": "array",
           "items": { "type": "string" }
