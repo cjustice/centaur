@@ -44,6 +44,7 @@ const DEFAULT_PERSONA_OPTIONS = [{ label: 'Base', value: DEFAULT_PERSONA_ID }]
 
 export function App() {
   const composerRef = useRef<HTMLFormElement | null>(null)
+  const resetThreadRef = useRef<(() => void) | null>(null)
   const [threadId, setThreadId] = useState(INITIAL_THREAD_ID)
   const [input, setInput] = useState('')
   const [personaOptions, setPersonaOptions] = useState<WebPersonaOption[]>(DEFAULT_PERSONA_OPTIONS)
@@ -60,20 +61,6 @@ export function App() {
   const harnessType = activeThread?.harnessType ?? DEFAULT_HARNESS_TYPE
   const personaId = activeThread?.personaId ?? DEFAULT_PERSONA_ID
   const activePersonaOptions = ensureSelectedPersonaOption(personaOptions, personaId)
-
-  useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent) {
-      const key = event.key.toLowerCase()
-      const isNewChatShortcut =
-        key === 'n' && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey
-      if (!isNewChatShortcut) return
-      event.preventDefault()
-      resetThread()
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
 
   useEffect(() => {
     if (threadIdFromLocation() !== threadId) {
@@ -289,6 +276,20 @@ export function App() {
     pushRouteForThread(nextThreadId)
     focusComposerInputSoon()
   }
+
+  resetThreadRef.current = resetThread
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (!isNewChatShortcut(event) || event.repeat) return
+      event.preventDefault()
+      event.stopPropagation()
+      resetThreadRef.current?.()
+    }
+
+    document.addEventListener('keydown', handleKeyDown, true)
+    return () => document.removeEventListener('keydown', handleKeyDown, true)
+  }, [])
 
   function selectThread(thread: ThreadSummary) {
     if (thread.id !== threadId) {
@@ -583,8 +584,7 @@ const Composer = (props: {
           value={props.input}
         />
         <div className="composer-controls">
-          <div className="composer-control-spacer" aria-hidden="true" />
-          <div className="composer-control-group align-end">
+          <div className="composer-control-group">
             <DropdownPill
               label="Model"
               onChange={props.onHarnessTypeChange}
@@ -598,6 +598,9 @@ const Composer = (props: {
               prefix="Persona:"
               value={props.personaId}
             />
+          </div>
+          <div className="composer-control-spacer" aria-hidden="true" />
+          <div className="composer-control-group align-end">
             <button
               aria-label="Send message"
               className="composer-send"
@@ -728,6 +731,12 @@ function createThreadSummary(
     status: 'Idle',
     title: 'New chat'
   }
+}
+
+function isNewChatShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase()
+  const isNKey = key === 'n' || event.code === 'KeyN'
+  return isNKey && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey
 }
 
 function normalizePersonaOptions(options: WebPersonaOption[] | undefined): WebPersonaOption[] {
