@@ -2171,3 +2171,57 @@ async def test_create_isolates_codex_api_key_from_claude_sandbox(
     proxy_yaml = fake_core.created_configmaps[0][1]["data"]["proxy.yaml"]
     assert "OPENAI_API_KEY" in proxy_yaml
     assert "ANTHROPIC_API_KEY" not in proxy_yaml
+
+
+def _status_pod(*, phase: str, sandbox_terminated: bool) -> SimpleNamespace:
+    terminated = (
+        SimpleNamespace(reason="OOMKilled", exit_code=137)
+        if sandbox_terminated
+        else None
+    )
+    return SimpleNamespace(
+        metadata=SimpleNamespace(deletion_timestamp=None),
+        status=SimpleNamespace(
+            phase=phase,
+            container_statuses=[
+                SimpleNamespace(
+                    name="sandbox", state=SimpleNamespace(terminated=terminated)
+                ),
+                SimpleNamespace(
+                    name="tool-server", state=SimpleNamespace(terminated=None)
+                ),
+            ],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_by_id_reports_stopped_when_agent_container_terminated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pod whose sandbox container OOMKilled must not read as ``running``.
+
+    The pod phase stays ``Running`` because the per-sandbox tool-server sidecar
+    survives the agent container's OOM kill. Reporting ``running`` makes the
+    execution worker reclaim-loop on a stream that EOFs immediately on every
+    reattach (dead container's stdout) until the hard deadline, instead of
+    finalizing the execution as failed.
+    """
+    from api.sandbox.kubernetes import KubernetesExecutorBackend
+
+    monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur")
+    backend = KubernetesExecutorBackend()
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(backend, "_ensure_clients", _noop)
+    fake_core = FakeCoreApi()
+    backend._core = fake_core  # type: ignore[attr-defined]
+
+    fake_core.pods_to_read = [_status_pod(phase="Running", sandbox_terminated=True)]
+    assert await backend.status_by_id("sandbox-x") == "stopped"
+
+    # Control: agent container still alive → genuinely running.
+    fake_core.pods_to_read = [_status_pod(phase="Running", sandbox_terminated=False)]
+    assert await backend.status_by_id("sandbox-x") == "running"

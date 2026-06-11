@@ -53,6 +53,23 @@ _READY_TIMEOUT_S = int(os.getenv("KUBERNETES_SANDBOX_READY_TIMEOUT_S", "60"))
 _ATTACH_LOG_TAIL_LINES = int(os.getenv("KUBERNETES_ATTACH_LOG_TAIL_LINES", "200"))
 _CONTAINER_NAME = "sandbox"
 _AGENT_UID = 1001
+
+
+def _agent_container_terminated(pod: Any) -> bool:
+    """True when the sandbox (agent) container has terminated.
+
+    The pod's ``phase`` stays ``Running`` as long as any container is alive, so
+    a crashed/OOMKilled agent container is hidden by the surviving per-sandbox
+    tool-server sidecar. This inspects the agent container's own state so the
+    caller can stop treating such a session as live.
+    """
+    statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+    for container_status in statuses:
+        if getattr(container_status, "name", None) != _CONTAINER_NAME:
+            continue
+        state = getattr(container_status, "state", None)
+        return getattr(state, "terminated", None) is not None
+    return False
 _SANDBOX_OVERLAY_ROOT = "/home/agent/overlay"
 _SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
 # Writable dir the tool-server sidecar installs overlay tool deps into. The
@@ -1900,6 +1917,15 @@ class KubernetesExecutorBackend(SandboxBackend):
             return "stopped"
         phase = (pod.status.phase or "").lower()
         if phase == "running":
+            # Pod phase stays "Running" while *any* container runs, so a
+            # crashed or OOMKilled agent container is masked by the surviving
+            # per-sandbox tool-server sidecar. Report "stopped" when the agent
+            # container itself has terminated, so callers finalize the
+            # execution (failed) instead of reconnecting to a dead container's
+            # stdout forever — a stream that EOFs immediately on every attach,
+            # which otherwise reclaim-loops until the hard deadline.
+            if _agent_container_terminated(pod):
+                return "stopped"
             return "running"
         if phase == "pending":
             return "created"
