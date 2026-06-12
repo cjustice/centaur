@@ -66,26 +66,15 @@ impl AppServerRuntime for CodexHarnessServer {
 }
 
 pub(crate) fn run_codex_blocks_server() -> Result<()> {
-    let mut codex = CodexJsonRpcChild::spawn()?;
     let mut stdout = io::stdout().lock();
     let mut request_id = 1_i64;
     let mut thread_id: Option<String> = None;
     let mut blocks_state = BlocksState::default();
-
-    let initialize_id = next_request_id(&mut request_id);
-    codex.send_request(
-        initialize_id,
-        "initialize",
-        json!({
-            "clientInfo": {
-                "name": "centaur-harness-server",
-                "title": null,
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": null,
-        }),
-    )?;
-    codex.read_response_or_forward(initialize_id, &mut stdout)?;
+    // The codex app-server child is spawned lazily on the first turn so the
+    // Slack thread env (below) is exported *before* the child exists — the
+    // child captures the environment at spawn and passes it to the tool
+    // subprocesses it runs (e.g. slack-upload).
+    let mut codex: Option<CodexJsonRpcChild> = None;
 
     let stdin = io::stdin();
     for raw in stdin.lock().lines() {
@@ -95,14 +84,28 @@ pub(crate) fn run_codex_blocks_server() -> Result<()> {
             continue;
         }
 
+        // Until the codex child is spawned (lazily, on the first turn), export
+        // the Slack thread env from each line's thread_key so the child — and
+        // the tools it runs (e.g. slack-upload) — inherit it. The thread_key is
+        // constant for the process, so re-exporting before spawn is idempotent.
+        if codex.is_none()
+            && let Some(thread_key) = thread_key_from_blocks_line(trimmed)
+        {
+            export_slack_thread_env(&thread_key);
+        }
+
         match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
             Ok(BlocksCommand::User {
                 input,
                 client_user_message_id,
                 model,
             }) => {
+                let codex = match codex {
+                    Some(ref mut codex) => codex,
+                    None => codex.insert(spawn_codex_app_server(&mut stdout, &mut request_id)?),
+                };
                 if let Err(error) = run_codex_user_turn(
-                    &mut codex,
+                    codex,
                     &mut stdout,
                     &mut request_id,
                     &mut thread_id,
@@ -134,6 +137,89 @@ pub(crate) fn run_codex_blocks_server() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Spawn the codex app-server child and complete the `initialize` handshake.
+///
+/// Deferred until the first user turn so that any Slack thread environment
+/// (`SLACK_CHANNEL`/`SLACK_THREAD_TS`) is exported before the child — and the
+/// tool subprocesses it spawns — capture the environment.
+fn spawn_codex_app_server<W: Write>(
+    stdout: &mut W,
+    request_id: &mut i64,
+) -> Result<CodexJsonRpcChild> {
+    let mut codex = CodexJsonRpcChild::spawn()?;
+    let initialize_id = next_request_id(request_id);
+    codex.send_request(
+        initialize_id,
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "centaur-harness-server",
+                "title": null,
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": null,
+        }),
+    )?;
+    codex.read_response_or_forward(initialize_id, stdout)?;
+    Ok(codex)
+}
+
+/// Derive `SLACK_CHANNEL`/`SLACK_THREAD_TS` from a Slack thread key and export
+/// them so sandbox tools such as `slack-upload` can target the originating
+/// thread. No-op for non-Slack threads.
+///
+/// Must be called before the codex app-server child is spawned (and thus while
+/// the process is still single-threaded), so the variables are inherited by the
+/// agent's tool subprocesses.
+fn export_slack_thread_env(thread_key: &str) {
+    let Some((channel, thread_ts)) = slack_channel_and_thread(thread_key) else {
+        return;
+    };
+    // SAFETY: called from `run_codex_blocks_server` before the codex child or
+    // its stdout reader thread is spawned, so no other thread is concurrently
+    // reading or writing the process environment.
+    unsafe {
+        env::set_var("SLACK_CHANNEL", channel);
+        env::set_var("SLACK_THREAD_TS", thread_ts);
+    }
+}
+
+/// Parse the `(channel, thread_ts)` pair out of a Slack thread key, supporting
+/// both the api-rs shape `slack:<channel>:<thread_ts>` and the legacy api shape
+/// `slack:<team>:<channel>:<thread_ts>`. Returns `None` for non-Slack keys,
+/// unexpected arities, or empty components.
+fn slack_channel_and_thread(thread_key: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = thread_key.split(':').collect();
+    if parts.first() != Some(&"slack") || !matches!(parts.len(), 3 | 4) {
+        return None;
+    }
+    let channel = parts[parts.len() - 2];
+    let thread_ts = parts[parts.len() - 1];
+    if channel.is_empty() || thread_ts.is_empty() {
+        return None;
+    }
+    Some((channel.to_string(), thread_ts.to_string()))
+}
+
+/// Pull the `thread_key` field out of a raw blocks input line without consuming
+/// the richer `parse_blocks_line_with_state` parse. Returns `None` when the
+/// field is absent, blank, or the line is not valid JSON.
+fn thread_key_from_blocks_line(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ThreadKeyProbe {
+        #[serde(default)]
+        thread_key: Option<String>,
+    }
+    let probe: ThreadKeyProbe = serde_json::from_str(line).ok()?;
+    let key = probe.thread_key?;
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn run_codex_user_turn<W: Write>(
@@ -442,4 +528,68 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout.contains("--listen") || stderr.contains("--listen")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{slack_channel_and_thread, thread_key_from_blocks_line};
+
+    #[test]
+    fn slack_channel_and_thread_parses_api_rs_three_part_key() {
+        assert_eq!(
+            slack_channel_and_thread("slack:C123:123.456"),
+            Some(("C123".to_string(), "123.456".to_string()))
+        );
+    }
+
+    #[test]
+    fn slack_channel_and_thread_parses_legacy_four_part_key() {
+        assert_eq!(
+            slack_channel_and_thread("slack:T999:C123:123.456"),
+            Some(("C123".to_string(), "123.456".to_string()))
+        );
+    }
+
+    #[test]
+    fn slack_channel_and_thread_ignores_non_slack_keys() {
+        assert_eq!(slack_channel_and_thread("web:t1"), None);
+    }
+
+    #[test]
+    fn slack_channel_and_thread_ignores_unexpected_arity() {
+        assert_eq!(slack_channel_and_thread("slack:C123"), None);
+        assert_eq!(slack_channel_and_thread("slack:T:C:1.2:extra"), None);
+    }
+
+    #[test]
+    fn slack_channel_and_thread_rejects_empty_components() {
+        assert_eq!(slack_channel_and_thread("slack::123.456"), None);
+        assert_eq!(slack_channel_and_thread("slack:C123:"), None);
+    }
+
+    #[test]
+    fn thread_key_from_blocks_line_extracts_key_from_user_turn() {
+        let line = r#"{"type":"user","thread_key":"slack:C123:123.456","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        assert_eq!(
+            thread_key_from_blocks_line(line).as_deref(),
+            Some("slack:C123:123.456")
+        );
+    }
+
+    #[test]
+    fn thread_key_from_blocks_line_is_none_when_absent_or_blank() {
+        assert_eq!(
+            thread_key_from_blocks_line(r#"{"type":"user","text":"hi"}"#),
+            None
+        );
+        assert_eq!(
+            thread_key_from_blocks_line(r#"{"type":"user","thread_key":"   "}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn thread_key_from_blocks_line_is_none_for_invalid_json() {
+        assert_eq!(thread_key_from_blocks_line("not json"), None);
+    }
 }

@@ -185,13 +185,7 @@ fn fake_amp_blocks_mode_accepts_user_blocks_by_default() {
 fn fake_codex_blocks_mode_spawns_app_server_and_translates_user_blocks() {
     let fake_codex = temp_path("fake-codex.sh");
     let fake_codex_log = temp_path("fake-codex-requests.jsonl");
-    let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable_script(&fake_codex, &fake_codex_app_server_script(&fake_codex_log));
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -244,6 +238,43 @@ fn fake_codex_blocks_mode_spawns_app_server_and_translates_user_blocks() {
 
     let _ = std::fs::remove_file(fake_codex);
     let _ = std::fs::remove_file(fake_codex_log);
+}
+
+#[test]
+fn codex_blocks_mode_exports_slack_thread_env_before_spawning_app_server() {
+    let fake_codex = temp_path("fake-codex-slack-env.sh");
+    let fake_codex_log = temp_path("fake-codex-slack-env-requests.jsonl");
+    let env_log = PathBuf::from(format!("{}.env", fake_codex_log.display()));
+    write_executable_script(&fake_codex, &fake_codex_app_server_script(&fake_codex_log));
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some((
+            "CODEX_BIN",
+            fake_codex.to_str().expect("utf-8 fake codex path"),
+        )),
+    );
+    // run_blocks_user_turn sends thread_key "slack:C123:123.456".
+    let turn = bridge.run_blocks_user_turn("say codex blocks", Duration::from_secs(10));
+    bridge.finish_successfully();
+    assert_completed_turn(&turn);
+
+    let recorded = std::fs::read_to_string(&env_log).unwrap_or_else(|error| {
+        panic!("fake codex did not record its env at {env_log:?}: {error}")
+    });
+    assert!(
+        recorded.contains("SLACK_CHANNEL=C123"),
+        "codex app-server should inherit SLACK_CHANNEL from the Slack thread_key; recorded={recorded:?}"
+    );
+    assert!(
+        recorded.contains("SLACK_THREAD_TS=123.456"),
+        "codex app-server should inherit SLACK_THREAD_TS from the Slack thread_key; recorded={recorded:?}"
+    );
+
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(fake_codex_log);
+    let _ = std::fs::remove_file(env_log);
 }
 
 #[test]
@@ -1345,6 +1376,10 @@ if [ "${1:-}" != "app-server" ]; then
   exit 64
 fi
 
+# Record the Slack thread env the harness exported before spawning us, so tests
+# can assert SLACK_CHANNEL/SLACK_THREAD_TS reach codex (and its tool subprocesses).
+printf 'SLACK_CHANNEL=%s\nSLACK_THREAD_TS=%s\n' "${SLACK_CHANNEL:-}" "${SLACK_THREAD_TS:-}" > "$log.env"
+
 request_id() {
   printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'
 }
@@ -1389,6 +1424,15 @@ fn temp_path(name: &str) -> PathBuf {
         std::process::id(),
         Uuid::new_v4().simple()
     ))
+}
+
+fn write_executable_script(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write script");
+    let mut permissions = std::fs::metadata(path)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod script");
 }
 
 fn shell_quote(path: &Path) -> String {
