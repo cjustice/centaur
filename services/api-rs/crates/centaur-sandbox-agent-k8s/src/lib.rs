@@ -729,11 +729,15 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
     let mut mounts = Vec::with_capacity(spec.mounts.len());
     for (index, mount) in spec.mounts.iter().enumerate() {
         let name = format!("mount-{index}");
-        mounts.push(json!({
+        let mut volume_mount = json!({
             "name": name,
             "mountPath": mount.target_path,
             "readOnly": mount.read_only,
-        }));
+        });
+        if let Some(sub_path) = &mount.sub_path {
+            volume_mount["subPath"] = json!(sub_path);
+        }
+        mounts.push(volume_mount);
         volumes.push(match &mount.kind {
             MountKind::EmptyDir => json!({
                 "name": name,
@@ -750,6 +754,12 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
                 "name": name,
                 "hostPath": {
                     "path": source_path,
+                },
+            }),
+            MountKind::ConfigMap { name: configmap_name } => json!({
+                "name": name,
+                "configMap": {
+                    "name": configmap_name,
                 },
             }),
         });
@@ -841,6 +851,32 @@ mod tests {
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
 
     use super::*;
+
+    #[test]
+    fn mount_json_renders_configmap_subpath() {
+        let spec = SandboxSpec::new("centaur-agent:latest").mount(
+            centaur_sandbox_core::Mount::new(
+                MountKind::ConfigMap {
+                    name: "centaur-centaur-overlay".to_owned(),
+                },
+                "/home/agent/AGENTS_OVERLAY.md",
+            )
+            .sub_path("SYSTEM_PROMPT.md")
+            .read_only(),
+        );
+
+        let (volumes, mounts) = mount_json(&spec);
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["configMap"]["name"], "centaur-centaur-overlay");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["mountPath"], "/home/agent/AGENTS_OVERLAY.md");
+        assert_eq!(mounts[0]["subPath"], "SYSTEM_PROMPT.md");
+        assert_eq!(mounts[0]["readOnly"], true);
+        // The generated volume name and volumeMount name must match so the
+        // mount resolves to the volume.
+        assert_eq!(volumes[0]["name"], mounts[0]["name"]);
+    }
 
     #[test]
     fn builds_agent_sandbox_spec_with_state_volume_and_limits() {

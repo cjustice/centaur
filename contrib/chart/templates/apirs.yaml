@@ -133,6 +133,10 @@ spec:
 {{- if .Values.overlay.systemPrompt }}
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
+            # api-rs mounts this ConfigMap's SYSTEM_PROMPT.md into each sandbox as
+            # ~/AGENTS_OVERLAY.md (the entrypoint appends it to AGENTS.md).
+            - name: KUBERNETES_OVERLAY_CONFIGMAP
+              value: {{ include "centaur.componentName" (dict "root" . "component" "overlay") | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}

@@ -94,6 +94,11 @@ pub struct Mount {
     pub kind: MountKind,
     pub target_path: String,
     pub read_only: bool,
+    /// Mount only this single sub-path of the source into `target_path`
+    /// (Kubernetes `volumeMount.subPath`). Lets a single ConfigMap key be
+    /// mounted as one file (e.g. the overlay prompt as `~/AGENTS_OVERLAY.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
 }
 
 impl Mount {
@@ -102,11 +107,17 @@ impl Mount {
             kind,
             target_path: target_path.into(),
             read_only: false,
+            sub_path: None,
         }
     }
 
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    pub fn sub_path(mut self, sub_path: impl Into<String>) -> Self {
+        self.sub_path = Some(sub_path.into());
         self
     }
 }
@@ -116,6 +127,9 @@ pub enum MountKind {
     EmptyDir,
     NamedVolume(String),
     Bind { source_path: String },
+    /// A Kubernetes ConfigMap by name. Combined with `Mount::sub_path`, a single
+    /// key is projected as one file.
+    ConfigMap { name: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

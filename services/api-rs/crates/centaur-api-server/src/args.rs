@@ -39,6 +39,12 @@ use crate::{
 };
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
+/// Where the org overlay system prompt is mounted in the sandbox. The sandbox
+/// entrypoint appends this file to the agent's effective `AGENTS.md`.
+const SANDBOX_OVERLAY_PROMPT_PATH: &str = "/home/agent/AGENTS_OVERLAY.md";
+/// Key in the overlay ConfigMap (rendered from `overlay.systemPrompt`) holding
+/// the prompt; projected as `SANDBOX_OVERLAY_PROMPT_PATH` via `subPath`.
+const OVERLAY_CONFIGMAP_PROMPT_KEY: &str = "SYSTEM_PROMPT.md";
 
 /// OTLP env always forwarded from the api-rs process into codex sandboxes,
 /// mirroring the Python control plane's `_SANDBOX_PASSTHROUGH_ENV_KEYS`. The
@@ -540,6 +546,14 @@ struct SandboxArgs {
     centaur_api_url: Option<String>,
     #[arg(long = "repos-path", env = "REPOS_PATH")]
     repos_path: Option<String>,
+    /// Name of the ConfigMap holding the org overlay system prompt (key
+    /// `SYSTEM_PROMPT.md`, rendered from the chart's `overlay.systemPrompt`).
+    /// When set, api-rs mounts that key into each sandbox as
+    /// `~/AGENTS_OVERLAY.md`, which the sandbox entrypoint appends to the
+    /// agent's `AGENTS.md`. Mirrors how the legacy Python control plane injected
+    /// the assembled prompt via a ConfigMap `subPath` mount.
+    #[arg(long = "overlay-configmap", env = "KUBERNETES_OVERLAY_CONFIGMAP")]
+    overlay_configmap: Option<String>,
     #[arg(
         long = "session-sandbox-passthrough-env",
         env = "SESSION_SANDBOX_PASSTHROUGH_ENV",
@@ -838,6 +852,20 @@ impl SandboxArgs {
                             },
                             SANDBOX_REPOS_MOUNT_PATH,
                         )
+                        .read_only(),
+                    );
+                }
+                if let Some(overlay_configmap) =
+                    clean_optional_value(self.overlay_configmap.as_deref())
+                {
+                    workload = workload.mount(
+                        Mount::new(
+                            MountKind::ConfigMap {
+                                name: overlay_configmap,
+                            },
+                            SANDBOX_OVERLAY_PROMPT_PATH,
+                        )
+                        .sub_path(OVERLAY_CONFIGMAP_PROMPT_KEY)
                         .read_only(),
                     );
                 }
@@ -2311,6 +2339,60 @@ mod tests {
                         source_path: "/var/lib/centaur/repos".to_owned(),
                     })
         }));
+    }
+
+    #[test]
+    fn codex_workload_mounts_overlay_configmap_as_agents_overlay() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--overlay-configmap",
+            "centaur-centaur-overlay",
+        ])
+        .unwrap();
+
+        let workload = args.sandbox.container_workload_mode().unwrap();
+        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        let overlay = mounts
+            .iter()
+            .find(|mount| mount.target_path == SANDBOX_OVERLAY_PROMPT_PATH)
+            .expect("overlay prompt mount present");
+        assert!(overlay.read_only);
+        assert_eq!(overlay.sub_path.as_deref(), Some(OVERLAY_CONFIGMAP_PROMPT_KEY));
+        assert_eq!(
+            overlay.kind,
+            MountKind::ConfigMap {
+                name: "centaur-centaur-overlay".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_workload_has_no_overlay_mount_when_unset() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+        ])
+        .unwrap();
+
+        let workload = args.sandbox.container_workload_mode().unwrap();
+        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+        assert!(
+            !mounts
+                .iter()
+                .any(|mount| mount.target_path == SANDBOX_OVERLAY_PROMPT_PATH)
+        );
     }
 
     #[test]
