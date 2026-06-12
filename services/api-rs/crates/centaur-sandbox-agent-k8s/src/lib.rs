@@ -756,10 +756,14 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
                     "path": source_path,
                 },
             }),
+            // `optional` so a missing/misnamed ConfigMap degrades gracefully
+            // (the consumer treats the mounted file as optional) instead of
+            // wedging the pod in ContainerCreating.
             MountKind::ConfigMap { name: configmap_name } => json!({
                 "name": name,
                 "configMap": {
                     "name": configmap_name,
+                    "optional": true,
                 },
             }),
         });
@@ -869,6 +873,7 @@ mod tests {
 
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["configMap"]["name"], "centaur-centaur-overlay");
+        assert_eq!(volumes[0]["configMap"]["optional"], true);
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0]["mountPath"], "/home/agent/AGENTS_OVERLAY.md");
         assert_eq!(mounts[0]["subPath"], "SYSTEM_PROMPT.md");
@@ -876,6 +881,53 @@ mod tests {
         // The generated volume name and volumeMount name must match so the
         // mount resolves to the volume.
         assert_eq!(volumes[0]["name"], mounts[0]["name"]);
+    }
+
+    #[test]
+    fn agent_sandbox_crd_round_trips_configmap_overlay_mount() {
+        // Guards the load-bearing step the isolated mount_json test can't: the
+        // rendered JSON must survive deserialization into the typed
+        // agents.x-k8s.io Sandbox CRD without the configMap volume / subPath
+        // being silently dropped (e.g. after a CRD regen).
+        let spec = SandboxSpec::new("centaur-agent:latest").mount(
+            centaur_sandbox_core::Mount::new(
+                MountKind::ConfigMap {
+                    name: "centaur-centaur-overlay".to_owned(),
+                },
+                "/home/agent/AGENTS_OVERLAY.md",
+            )
+            .sub_path("SYSTEM_PROMPT.md")
+            .read_only(),
+        );
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        let volume = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v.config_map
+                    .as_ref()
+                    .and_then(|cm| cm.name.as_deref())
+                    == Some("centaur-centaur-overlay")
+            })
+            .expect("overlay configMap volume present in CRD");
+        assert_eq!(volume.config_map.as_ref().unwrap().optional, Some(true));
+
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mount_path == "/home/agent/AGENTS_OVERLAY.md")
+            .expect("overlay volumeMount present in CRD");
+        assert_eq!(mount.sub_path.as_deref(), Some("SYSTEM_PROMPT.md"));
+        assert_eq!(mount.name, volume.name);
+        assert_eq!(mount.read_only, Some(true));
     }
 
     #[test]
