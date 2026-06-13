@@ -167,6 +167,34 @@ else:
     for name in sorted(feature_names - seen):
         rewritten.append(f"{name} = false")
     lines = lines[: features_start + 1] + rewritten + lines[features_end:]
+
+# Optional deploy-time override of the codex reasoning effort. Lets a deployment
+# (e.g. an org overlay via sandbox.extraEnv) set the default without forking the
+# baked-in config.toml. Validated against codex's ReasoningEffort enum; an
+# unknown value is ignored (the config default stands) rather than written.
+effort = (os.environ.get("CENTAUR_CODEX_REASONING_EFFORT") or "").strip().lower()
+if effort:
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    if effort not in valid:
+        import sys
+
+        print(
+            f"ignoring invalid CENTAUR_CODEX_REASONING_EFFORT={effort!r}; "
+            f"expected one of {sorted(valid)}",
+            file=sys.stderr,
+        )
+    else:
+        # model_reasoning_effort is a top-level key, before the first [table].
+        first_table = next(
+            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
+        )
+        override = f'model_reasoning_effort = "{effort}"'
+        for i in range(first_table):
+            if lines[i].split("=", 1)[0].strip() == "model_reasoning_effort":
+                lines[i] = override
+                break
+        else:
+            lines.insert(first_table, override)
 path.write_text("\n".join(lines).rstrip() + "\n")
 PYEOF
 else
