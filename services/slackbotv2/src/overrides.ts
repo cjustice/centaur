@@ -36,6 +36,8 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> = 
 
 const MODEL_FLAG_PATTERN = /(?:^|\s)--model[=\s]+([A-Za-z0-9._/-]+)(?=\s|$)/i
 
+// Single dash by design: a short per-turn knob (`-rsn high`), so it can't reuse
+// the `--`-prefixed flagPattern() helper. Value-capturing like --model.
 const REASONING_FLAG_PATTERN = /(?:^|\s)-rsn[=\s]+([A-Za-z-]+)(?=\s|$)/i
 
 // Codex reasoning efforts (turn/start `effort`), plus convenience aliases.
