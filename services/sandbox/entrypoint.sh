@@ -142,6 +142,7 @@ if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
 from pathlib import Path
 import os
+import sys
 
 path = Path(os.environ["CODEX_CONFIG_PATH"])
 lines = path.read_text().splitlines()
@@ -170,16 +171,15 @@ else:
 
 # Optional deploy-time override of the codex reasoning effort. Lets a deployment
 # (e.g. an org overlay via sandbox.extraEnv) set the default without forking the
-# baked-in config.toml. Validated against codex's ReasoningEffort enum; an
-# unknown value is ignored (the config default stands) rather than written.
-effort = (os.environ.get("CENTAUR_CODEX_REASONING_EFFORT") or "").strip().lower()
+# baked-in config.toml. Named after codex's own config key (model_reasoning_effort)
+# and validated against its ReasoningEffort enum; an unknown value is ignored (the
+# config default stands) rather than written.
+effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
 if effort:
     valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
     if effort not in valid:
-        import sys
-
         print(
-            f"ignoring invalid CENTAUR_CODEX_REASONING_EFFORT={effort!r}; "
+            f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
             f"expected one of {sorted(valid)}",
             file=sys.stderr,
         )
