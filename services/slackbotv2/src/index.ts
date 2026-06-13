@@ -278,10 +278,11 @@ async function syncThreadMessageToSession(
   const serializedMessage = await serializeMessage(message)
   const overrides = extractMessageOverrides(serializedMessage.text)
   serializedMessage.text = overrides.cleanedText
-  if (overrides.harnessType || overrides.model) {
+  if (overrides.harnessType || overrides.model || overrides.reasoning) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
-      model: overrides.model
+      model: overrides.model,
+      reasoning: overrides.reasoning
     })
   }
   traceLog(input.options, 'slackbotv2_forward_message_serialized', trace, {
@@ -323,6 +324,7 @@ async function syncThreadMessageToSession(
     harnessType: overrides.harnessType,
     messages: messagesToAppend,
     model: overrides.model,
+    reasoning: overrides.reasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },

@@ -3,16 +3,20 @@
  *   --claude | --claude-code | --amp | --codex   pick the harness for the thread
  *   --model <name> (or --model=<name>)           pick the model within that harness
  *   --opus | --sonnet | --haiku                  model shortcuts (imply claude-code)
+ *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex)
  *
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation (the API pins a thread to one harness); the model
- * applies per turn via the blocks-protocol `model` field.
+ * and reasoning effort apply per turn via the blocks-protocol `model` /
+ * `reasoning` fields. Reasoning effort only affects the codex harness (it maps
+ * to codex's `turn/start` `effort`); other harnesses ignore it.
  */
 
 export type MessageOverrides = {
   cleanedText: string
   harnessType?: string
   model?: string
+  reasoning?: string
 }
 
 // Flag name -> HarnessType wire value (serde lowercase of the Rust enum).
@@ -32,15 +36,42 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> = 
 
 const MODEL_FLAG_PATTERN = /(?:^|\s)--model[=\s]+([A-Za-z0-9._/-]+)(?=\s|$)/i
 
+const REASONING_FLAG_PATTERN = /(?:^|\s)-rsn[=\s]+([A-Za-z-]+)(?=\s|$)/i
+
+// Codex reasoning efforts (turn/start `effort`), plus convenience aliases.
+const REASONING_EFFORTS: Record<string, string> = {
+  none: 'none',
+  minimal: 'minimal',
+  min: 'minimal',
+  low: 'low',
+  medium: 'medium',
+  med: 'medium',
+  high: 'high',
+  hi: 'high',
+  xhigh: 'xhigh',
+  xhi: 'xhigh',
+  'x-high': 'xhigh'
+}
+
 export function extractMessageOverrides(text: string): MessageOverrides {
   let cleaned = text
   let harnessType: string | undefined
   let model: string | undefined
+  let reasoning: string | undefined
 
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned)
   if (modelMatch) {
     model = modelMatch[1]
     cleaned = stripMatch(cleaned, modelMatch)
+  }
+
+  const reasoningMatch = REASONING_FLAG_PATTERN.exec(cleaned)
+  if (reasoningMatch) {
+    const normalized = REASONING_EFFORTS[reasoningMatch[1].toLowerCase()]
+    if (normalized) {
+      reasoning = normalized
+      cleaned = stripMatch(cleaned, reasoningMatch)
+    }
   }
 
   for (const [flag, harness] of Object.entries(HARNESS_FLAGS)) {
@@ -61,7 +92,8 @@ export function extractMessageOverrides(text: string): MessageOverrides {
   return {
     cleanedText: cleaned === text ? text : cleaned.trim(),
     harnessType,
-    model
+    model,
+    reasoning
   }
 }
 

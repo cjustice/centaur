@@ -168,7 +168,8 @@ export async function forwardToSessionApi(
     input.threadId,
     input.executeMessage,
     input.model,
-    input.executeContextMessages
+    input.executeContextMessages,
+    input.reasoning
   )
   traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
     execution_id: execution.execution_id,
@@ -620,14 +621,15 @@ async function executeSession(
   threadId: string,
   message: SlackbotV2ApiMessage,
   model?: string,
-  contextMessages?: SlackbotV2ApiMessage[]
+  contextMessages?: SlackbotV2ApiMessage[],
+  reasoning?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
   const body: SlackbotV2ExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
-    input_lines: toCodexInputLines(message, threadId, model, requesterIdentity, contextMessages),
+    input_lines: toCodexInputLines(message, threadId, model, requesterIdentity, contextMessages, reasoning),
     ...(options.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: options.idleTimeoutMs }),
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
   }
@@ -776,7 +778,8 @@ function toCodexInputLines(
   threadId: string,
   model?: string,
   requesterIdentity?: RequesterIdentity,
-  contextMessages?: SlackbotV2ApiMessage[]
+  contextMessages?: SlackbotV2ApiMessage[],
+  reasoning?: string
 ): string[] {
   const staged = new Map<SlackbotV2ApiAttachment, string>()
   const lines: string[] = []
@@ -788,7 +791,8 @@ function toCodexInputLines(
       staged,
       model,
       requesterIdentity,
-      contextMessages
+      contextMessages,
+      reasoning
     )
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -807,7 +811,8 @@ function toCodexInputLines(
       staged,
       model,
       requesterIdentity,
-      contextMessages
+      contextMessages,
+      reasoning
     )
   )
   return lines
@@ -819,13 +824,15 @@ function toCodexInputLineWithStaged(
   staged: Map<SlackbotV2ApiAttachment, string>,
   model?: string,
   requesterIdentity?: RequesterIdentity,
-  contextMessages?: SlackbotV2ApiMessage[]
+  contextMessages?: SlackbotV2ApiMessage[],
+  reasoning?: string
 ): string {
   return JSON.stringify({
     type: 'user',
     thread_key: threadId,
     trace_metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
     ...(model ? { model } : {}),
+    ...(reasoning ? { reasoning } : {}),
     message: {
       role: 'user',
       content: codexInputContent(message, staged, requesterIdentity, contextMessages)
