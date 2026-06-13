@@ -759,7 +759,9 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
             // `optional` so a missing/misnamed ConfigMap degrades gracefully
             // (the consumer treats the mounted file as optional) instead of
             // wedging the pod in ContainerCreating.
-            MountKind::ConfigMap { name: configmap_name } => json!({
+            MountKind::ConfigMap {
+                name: configmap_name,
+            } => json!({
                 "name": name,
                 "configMap": {
                     "name": configmap_name,
@@ -910,9 +912,7 @@ mod tests {
             .unwrap()
             .iter()
             .find(|v| {
-                v.config_map
-                    .as_ref()
-                    .and_then(|cm| cm.name.as_deref())
+                v.config_map.as_ref().and_then(|cm| cm.name.as_deref())
                     == Some("centaur-centaur-overlay")
             })
             .expect("overlay configMap volume present in CRD");

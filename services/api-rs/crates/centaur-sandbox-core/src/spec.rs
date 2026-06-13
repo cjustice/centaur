@@ -126,10 +126,14 @@ impl Mount {
 pub enum MountKind {
     EmptyDir,
     NamedVolume(String),
-    Bind { source_path: String },
+    Bind {
+        source_path: String,
+    },
     /// A Kubernetes ConfigMap by name. Combined with `Mount::sub_path`, a single
     /// key is projected as one file.
-    ConfigMap { name: String },
+    ConfigMap {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

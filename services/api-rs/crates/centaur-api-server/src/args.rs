@@ -2364,7 +2364,10 @@ mod tests {
             .find(|mount| mount.target_path == SANDBOX_OVERLAY_PROMPT_PATH)
             .expect("overlay prompt mount present");
         assert!(overlay.read_only);
-        assert_eq!(overlay.sub_path.as_deref(), Some(OVERLAY_CONFIGMAP_PROMPT_KEY));
+        assert_eq!(
+            overlay.sub_path.as_deref(),
+            Some(OVERLAY_CONFIGMAP_PROMPT_KEY)
+        );
         assert_eq!(
             overlay.kind,
             MountKind::ConfigMap {
