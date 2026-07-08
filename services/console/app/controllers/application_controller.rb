@@ -9,6 +9,15 @@ class ApplicationController < ActionController::Base
   # controllers don't each hand-roll a rescue. Mirrors Api::BaseController.
   rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
 
+  # A tokenless or stale-CSRF POST is an expected 4xx on a public, cookie-session
+  # UI: bots probing form endpoints, or a user submitting a login form after
+  # their session (and CSRF token) rotated. Handle it as a normal bad request
+  # instead of letting it bubble up as an unhandled exception — which Rails logs
+  # at error level and trips error tracking. CSRF protection is unchanged — the
+  # request is still rejected; we only stop treating an expected rejection as an
+  # error.
+  rescue_from ActionController::InvalidAuthenticityToken, with: :handle_invalid_authenticity_token
+
   helper_method :current_user, :acting_admin?, :descoped?
   helper_method :public_base_url, :oauth_callback_redirect_uri
 
@@ -186,6 +195,18 @@ class ApplicationController < ActionController::Base
 
   def render_not_found(e)
     render plain: e.message, status: :not_found
+  end
+
+  # Reject the request (CSRF protection is preserved) but log at warn, not error,
+  # so an expected tokenless POST does not page. HTML callers are bounced to a
+  # fresh login form (the usual cause is an expired session); anything else gets
+  # a bare 422.
+  def handle_invalid_authenticity_token
+    Rails.logger.warn("invalid_authenticity_token path=#{request.path} method=#{request.request_method}")
+    respond_to do |format|
+      format.html { redirect_to login_path, alert: "Your session expired. Please sign in again." }
+      format.any { head :unprocessable_entity }
+    end
   end
 
   def console_sidebar_visible_thread_scope

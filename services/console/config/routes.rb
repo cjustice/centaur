@@ -201,5 +201,10 @@ Rails.application.routes.draw do
   get "oauth/:slug/callback", to: "oauth/flows#callback", as: :oauth_callback
 
   # Render a JSON 404 for any unmatched route instead of the static error page.
-  match "*path", to: "errors#not_found", via: :all
+  # The `(*path)` glob is optional so it also matches the site root: a non-GET
+  # request to "/" (e.g. a bot POSTing "/") falls through here for a clean 404
+  # instead of raising ActionController::RoutingError. A bare "*path" glob does
+  # not match the empty root path, so those POSTs used to raise an unhandled
+  # RoutingError — logged at error level, and noise for any error tracker.
+  match "(*path)", to: "errors#not_found", via: :all
 end
