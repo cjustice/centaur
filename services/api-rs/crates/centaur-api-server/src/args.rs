@@ -1589,6 +1589,14 @@ struct IronProxyArgs {
         env = "KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY"
     )]
     image_pull_policy: Option<String>,
+    /// ServiceAccount for proxy pods. Bind it to a cloud identity (e.g. GKE
+    /// Workload Identity) to enable ambient-credential transforms; unset keeps
+    /// the namespace default (no cloud identity).
+    #[arg(
+        long = "kubernetes-iron-proxy-service-account-name",
+        env = "KUBERNETES_IRON_PROXY_SERVICE_ACCOUNT_NAME"
+    )]
+    service_account_name: Option<String>,
     #[arg(
         long = "kubernetes-iron-proxy-upstream-deny-cidrs",
         env = "KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS",
@@ -1631,6 +1639,7 @@ impl IronProxyArgs {
         let mut config =
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
+        config.service_account_name = self.service_account_name.clone();
         config.upstream_deny_cidrs = self
             .upstream_deny_cidrs
             .iter()

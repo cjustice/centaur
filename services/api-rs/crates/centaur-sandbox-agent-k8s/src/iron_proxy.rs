@@ -75,6 +75,16 @@ const PROXY_REASSIGN_FALLBACK_DELAY: Duration = Duration::from_secs(6);
 pub struct IronProxyConfig {
     pub image: String,
     pub image_pull_policy: Option<String>,
+    /// Kubernetes ServiceAccount the proxy pod runs under. `None` (the default)
+    /// leaves the pod on the namespace default ServiceAccount, holding no cloud
+    /// identity. Set this to a ServiceAccount bound to a cloud identity — e.g.
+    /// via GKE Workload Identity — so credential-minting transforms that resolve
+    /// ambient credentials (such as `gcp_auth` / `gcp_id_token` with
+    /// `credentials_provider: workload_identity`) can mint tokens. The
+    /// ServiceAccount token is still never mounted (`automountServiceAccountToken`
+    /// stays `false`): Workload Identity resolves through the node metadata
+    /// server keyed on the pod's ServiceAccount, not a mounted token.
+    pub service_account_name: Option<String>,
     pub fragments: Vec<ProxyFragment>,
     pub source_policy: SourcePolicy,
     pub ca_cert_secret_name: String,
@@ -97,6 +107,7 @@ impl IronProxyConfig {
         Self {
             image: image.into(),
             image_pull_policy: None,
+            service_account_name: None,
             fragments: Vec::new(),
             source_policy: SourcePolicy::default(),
             ca_cert_secret_name: ca_cert_secret_name.into(),
@@ -1161,7 +1172,13 @@ fn build_iron_proxy_pod(
             annotations,
         ),
         spec: Some(PodSpec {
+            // Never mount the ServiceAccount token: the proxy has no need for
+            // the Kubernetes API, and Workload Identity resolves through the
+            // node metadata server (keyed on `service_account_name`), not this
+            // token. Setting one without the other keeps the pod's cloud
+            // identity ambient-only.
             automount_service_account_token: Some(false),
+            service_account_name: iron_proxy.service_account_name.clone(),
             restart_policy: Some("Never".to_owned()),
             containers: vec![iron_proxy_container(iron_proxy, resolved, sync)],
             volumes: Some(iron_proxy_volumes(iron_proxy)),
@@ -2258,6 +2275,49 @@ mod tests {
             deny_cidrs,
             Some("169.254.169.254/32,127.0.0.0/8,10.42.0.0/16,10.43.0.0/16")
         );
+    }
+
+    #[test]
+    fn proxy_pod_service_account_defaults_to_none() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let sync = ProxySyncEnv {
+            proxy_id: "proxy-id".to_owned(),
+            control_url: "http://iron-control".to_owned(),
+            token: "proxy-token".to_owned(),
+        };
+
+        let spec = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync)
+            .spec
+            .expect("pod spec");
+
+        assert_eq!(spec.service_account_name, None);
+        assert_eq!(spec.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn proxy_pod_runs_under_configured_service_account_without_mounting_token() {
+        let id = SandboxId::new("asbx-test");
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy.service_account_name = Some("iron-proxy-egress".to_owned());
+        let sync = ProxySyncEnv {
+            proxy_id: "proxy-id".to_owned(),
+            control_url: "http://iron-control".to_owned(),
+            token: "proxy-token".to_owned(),
+        };
+
+        let spec = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync)
+            .spec
+            .expect("pod spec");
+
+        assert_eq!(
+            spec.service_account_name.as_deref(),
+            Some("iron-proxy-egress")
+        );
+        // Workload Identity keys off the pod's ServiceAccount through the
+        // metadata server, so the token stays unmounted even when a SA is set:
+        // the proxy gets an ambient cloud identity, never a Kubernetes API token.
+        assert_eq!(spec.automount_service_account_token, Some(false));
     }
 
     #[test]
