@@ -570,6 +570,90 @@ describe('slackbotv2', () => {
     expect(JSON.parse(executeBody.input_lines.at(-1)!).model).toBeUndefined()
   })
 
+  it('forwards a per-channel default model and reasoning effort onto the input line', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: { [CHANNEL_ID]: { model: 'gpt-5.2', reasoning: 'high' } }
+    })
+
+    const parent = await postUserMessage('Channel default thread context.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> investigate this`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> investigate this`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    // No explicit --model/-rsn, but the channel default rides the input line
+    // (unlike the deployment/baked default) and is recorded for the Console.
+    expect(codexApi.executes).toHaveLength(1)
+    const executeBody = codexApi.executes[0]!.body
+    const inputLine = JSON.parse(executeBody.input_lines.at(-1)!) as Record<string, unknown>
+    expect(inputLine.model).toBe('gpt-5.2')
+    expect(inputLine.reasoning).toBe('high')
+    expect(executeBody.metadata.model).toBe('gpt-5.2')
+  })
+
+  it('lets an explicit --model/-rsn override win over the per-channel default', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: { [CHANNEL_ID]: { model: 'gpt-5.2', reasoning: 'high' } }
+    })
+
+    const parent = await postUserMessage('Channel default override thread context.')
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> --model gpt-5.4 -rsn low go`,
+      parent.ts
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default-override',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --model gpt-5.4 -rsn low go`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    expect(codexApi.executes).toHaveLength(1)
+    const inputLine = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<
+      string,
+      unknown
+    >
+    expect(inputLine.model).toBe('gpt-5.4')
+    expect(inputLine.reasoning).toBe('low')
+  })
+
   it('includes all preceding Slack thread messages for a first mid-thread mention', async () => {
     const parent = await postUserMessage('Root context for the thread.')
     const firstReply = await postUserMessage('First preceding reply.', parent.ts)

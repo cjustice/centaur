@@ -51,6 +51,7 @@ import {
   defaultModelForHarness,
   type SlackContextBlock
 } from './console-session-link'
+import { resolveChannelDefault } from './channel-defaults'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
@@ -762,11 +763,18 @@ async function syncThreadMessageToSession(
   const isFirstAssistantMessage = shouldStartExecution && executedMessageIds.size === 0
   const effectiveHarnessType =
     effectiveOverrides.harnessType ?? input.options.defaultHarnessType ?? 'codex'
-  // Without an explicit --model/--opus/... override the harness runs its
+  // A channel may pin a default model / reasoning effort. It sits below an
+  // explicit or sticky per-thread --model/-rsn override and above the
+  // deployment/baked default, and — unlike the deployment default — must ride
+  // the harness input line to take effect (the harness does not know about it).
+  const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const overrideOrChannelModel = effectiveOverrides.model ?? channelDefault?.model
+  const overrideOrChannelReasoning = overrides.reasoning ?? channelDefault?.reasoning
+  // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
   const effectiveModel =
-    effectiveOverrides.model ??
+    overrideOrChannelModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
   const effectiveEffort =
     effectiveHarnessType === 'codex'
@@ -850,10 +858,10 @@ async function syncThreadMessageToSession(
     // restarting the thread out from under an active execution would kill it.
     harnessType: shouldStartExecution ? effectiveOverrides.harnessType : undefined,
     messages: messagesToAppend,
-    model: shouldStartExecution ? effectiveOverrides.model : undefined,
+    model: shouldStartExecution ? overrideOrChannelModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
     provider: shouldStartExecution ? effectiveOverrides.provider : undefined,
-    reasoning: overrides.reasoning,
+    reasoning: overrideOrChannelReasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
