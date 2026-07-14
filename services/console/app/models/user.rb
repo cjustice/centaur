@@ -38,6 +38,31 @@ class User < ApplicationRecord
     mcp_oauth_refresh_tokens.usable.update_all(revoked_at: now, updated_at: now)
   end
 
+  # Raised when an SSO identity a user is trying to link is already bound to a
+  # different console account.
+  IdentityConflict = Class.new(StandardError)
+
+  # Attaches an SSO +identity+ to THIS already-authenticated user, without any
+  # provisioning or session change -- the account-linking counterpart to
+  # link_or_provision. Used by the authenticated "Connect" flow for link-only
+  # providers (e.g. Slack), where the existing session is the trust anchor, so
+  # no email match is required. The (provider, subject) DB uniqueness prevents
+  # one IdP account from being claimed by two users; we surface that as an
+  # IdentityConflict rather than a bare RecordInvalid. A subject already bound to
+  # this same user is refreshed idempotently.
+  def link_identity!(provider:, identity:)
+    existing = UserIdentity.find_by(provider: provider, subject: identity[:subject])
+    raise IdentityConflict if existing && existing.user_id != id
+
+    attributes = { email: identity[:email], email_verified: identity[:email_verified] }
+    if provider == UserIdentity::SLACK_PROVIDER && identity[:team_id].present?
+      attributes[:team_id] = identity[:team_id]
+    end
+    record = user_identities.find_or_initialize_by(provider: provider, subject: identity[:subject])
+    record.update!(attributes)
+    record
+  end
+
   # Resolves the console user behind a verified SSO identity, creating or linking
   # as needed, and (re)caches the identity's email/name. A returning login matches
   # by the stable (provider, subject). A new identity links to an existing user

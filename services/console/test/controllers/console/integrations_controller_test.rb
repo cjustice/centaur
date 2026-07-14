@@ -101,4 +101,41 @@ class Console::IntegrationsControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
     assert_select "a[href=?]", "http://www.example.com/oauth/google/start"
   end
+
+  test "the Linked accounts section is hidden when no provider is link-only" do
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
+    get console_integrations_url
+    assert_response :ok
+    assert_no_match "Linked accounts", response.body
+  end
+
+  LINK_ONLY_ENV = %w[
+    CENTAUR_CONSOLE_SLACK_CLIENT_ID CENTAUR_CONSOLE_SLACK_CLIENT_SECRET CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS
+  ].freeze
+
+  test "a link-only provider renders Connect, then Disconnect once linked" do
+    prev = ENV.to_hash.slice(*LINK_ONLY_ENV)
+    # A provider must be BOTH configured (client creds) and link-only to appear
+    # as a linkable account.
+    ENV["CENTAUR_CONSOLE_SLACK_CLIENT_ID"] = "slack-login-client-id"
+    ENV["CENTAUR_CONSOLE_SLACK_CLIENT_SECRET"] = "slack-login-secret"
+    ENV["CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS"] = "slack"
+    member = users(:member_user)
+    post login_url, params: { email: member.email, password: "password123456" }
+
+    get console_integrations_url
+    assert_response :ok
+    assert_match "Linked accounts", response.body
+    assert_select "a.btn-primary[href=?]", auth_connect_path(provider: "slack"), text: "Connect"
+
+    member.user_identities.create!(
+      provider: "slack", subject: "U-linked", email: member.email, email_verified: true
+    )
+    get console_integrations_url
+    assert_response :ok
+    assert_select "form[action=?]", console_identity_path(member.user_identities.find_by(provider: "slack"))
+  ensure
+    LINK_ONLY_ENV.each { |k| ENV.delete(k) }
+    prev&.each { |k, v| ENV[k] = v }
+  end
 end

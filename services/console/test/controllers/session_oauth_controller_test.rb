@@ -7,8 +7,10 @@ require "test_helper"
 # HTTP double returning a canned token response (mirrors the broker flow test).
 class SessionOauthControllerTest < ActionDispatch::IntegrationTest
   GOOGLE_CLIENT_ID = "google-login-client-id".freeze
+  SLACK_CLIENT_ID = "slack-login-client-id".freeze
   ENV_KEYS = %w[
     CENTAUR_CONSOLE_GOOGLE_CLIENT_ID CENTAUR_CONSOLE_GOOGLE_CLIENT_SECRET CENTAUR_CONSOLE_BOOTSTRAP_ADMINS
+    CENTAUR_CONSOLE_SLACK_CLIENT_ID CENTAUR_CONSOLE_SLACK_CLIENT_SECRET CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS
   ].freeze
 
   setup do
@@ -186,5 +188,98 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
     get auth_callback_url(provider: "google"), params: { code: "bad", state: state }
     assert_redirected_to login_path
     assert_nil session[:user_id]
+  end
+
+  # --- link-only providers (e.g. Slack) --------------------------------------
+
+  def configure_slack_link_only
+    ENV["CENTAUR_CONSOLE_SLACK_CLIENT_ID"] = SLACK_CLIENT_ID
+    ENV["CENTAUR_CONSOLE_SLACK_CLIENT_SECRET"] = "slack-login-secret"
+    ENV["CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS"] = "slack"
+  end
+
+  def sign_in(user)
+    post login_url, params: { email: user.email, password: "password123456" }
+    assert_equal user.id, session[:user_id]
+  end
+
+  def slack_token_body(sub:, email:, team_id: "T123", email_verified: true)
+    {
+      access_token: "AT",
+      id_token: id_token({
+        "aud" => SLACK_CLIENT_ID, "iss" => "https://slack.com", "sub" => sub,
+        "email" => email, "email_verified" => email_verified, "name" => "Slack User",
+        Login::Providers::Slack::TEAM_ID_CLAIM => team_id
+      })
+    }.to_json
+  end
+
+  def connect_flow
+    get auth_connect_url(provider: "slack")
+    assert_response :redirect
+    URI.decode_www_form(URI.parse(response.location).query).to_h.fetch("state")
+  end
+
+  test "a link-only provider cannot be used to log in" do
+    configure_slack_link_only
+    get auth_start_url(provider: "slack")
+    assert_redirected_to login_path
+    assert_equal "That sign-in method is not available.", flash[:alert]
+  end
+
+  test "the login page hides link-only providers" do
+    configure_slack_link_only
+    get login_url
+    assert_response :ok
+    assert_select "a[href=?]", auth_start_path(provider: "slack"), count: 0
+    assert_select "a[href=?]", auth_start_path(provider: "google"), text: /Continue with Google/
+  end
+
+  test "connect requires an authenticated session" do
+    configure_slack_link_only
+    get auth_connect_url(provider: "slack")
+    assert_redirected_to login_path
+    assert_nil session[:user_id]
+  end
+
+  test "connect links the provider to the signed-in account without switching users" do
+    configure_slack_link_only
+    member = users(:member_user)
+    sign_in(member)
+    stub_exchange(status: 200, body: slack_token_body(sub: "U-member", email: "member.slack@acme.example"))
+    state = connect_flow
+    assert_difference -> { member.user_identities.where(provider: "slack").count }, 1 do
+      get auth_callback_url(provider: "slack"), params: { code: "the-code", state: state }
+    end
+    assert_redirected_to console_integrations_path
+    assert_equal "Linked your Slack account.", flash[:notice]
+    # Same session, same user -- linking never re-authenticates.
+    assert_equal member.id, session[:user_id]
+    identity = member.user_identities.find_by(provider: "slack")
+    assert_equal "U-member", identity.subject
+    assert_equal "T123", identity.team_id
+  end
+
+  test "connect refuses to link a Slack account already linked to another user" do
+    configure_slack_link_only
+    member = users(:member_user)
+    sign_in(member)
+    # slack-pending-sub is bound to pending_user via fixtures.
+    stub_exchange(status: 200, body: slack_token_body(sub: "slack-pending-sub", email: "member@acme.example"))
+    state = connect_flow
+    assert_no_difference -> { member.user_identities.where(provider: "slack").count } do
+      get auth_callback_url(provider: "slack"), params: { code: "the-code", state: state }
+    end
+    assert_redirected_to console_integrations_path
+    assert_match(/already linked/i, flash[:alert])
+  end
+
+  test "connect rejects a non-link-only provider" do
+    # Google is a login provider, not linkable; connect must refuse it even when
+    # signed in.
+    sign_in(users(:member_user))
+    get auth_connect_url(provider: "google")
+    assert_redirected_to console_integrations_path
+    assert_equal "That account can't be linked.", flash[:alert]
   end
 end

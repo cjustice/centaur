@@ -27,6 +27,12 @@ Rails.application.routes.draw do
   # /oauth/:slug/* consent flow below.
   get "auth/:provider/start", to: "session_oauth#start", as: :auth_start
   get "auth/:provider/callback", to: "session_oauth#callback", as: :auth_callback
+  # Link a provider to the signed-in account (link-only providers, e.g. Slack).
+  # Authenticated -- distinct from /start, which logs in/provisions.
+  get "auth/:provider/connect", to: "session_oauth#connect", as: :auth_connect
+  # Remove a linked SSO identity from the signed-in account.
+  delete "console/integrations/identities/:id", to: "console/identities#destroy",
+         as: :console_identity
 
   # MCP OAuth authorization server. MCP clients discover this from api-rs'
   # OAuth protected-resource metadata and register public PKCE clients here.

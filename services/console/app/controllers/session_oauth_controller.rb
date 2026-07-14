@@ -33,13 +33,32 @@ class SessionOauthController < ApplicationController
 
   before_action :set_provider
 
-  # GET /auth/:provider/start
+  # GET /auth/:provider/start -- begin a login (authenticate + provision).
   def start
+    if ConsoleAuth.link_only?(@key)
+      return redirect_to login_path, alert: "That sign-in method is not available."
+    end
+    begin_flow(mode: "login")
+  end
+
+  # GET /auth/:provider/connect -- begin linking a provider to the signed-in
+  # account. Only link-only providers use this; it never logs in or provisions.
+  def connect
+    return redirect_to login_path unless current_user
+    unless ConsoleAuth.link_only?(@key)
+      return redirect_to console_integrations_path, alert: "That account can't be linked."
+    end
+    begin_flow(mode: "link")
+  end
+
+  # Builds the signed state (carrying the flow +mode+) + PKCE cookie and sends
+  # the browser to the IdP. Shared by #start (login) and #connect (link).
+  def begin_flow(mode:)
     nonce = SecureRandom.urlsafe_base64(32)
     code_verifier = SecureRandom.urlsafe_base64(64)
 
     state = Rails.application.message_verifier(STATE_PURPOSE).generate(
-      { "provider" => @key, "nonce" => nonce },
+      { "provider" => @key, "nonce" => nonce, "mode" => mode },
       purpose: STATE_PURPOSE, expires_in: FLOW_TTL
     )
 
@@ -52,6 +71,7 @@ class SessionOauthController < ApplicationController
 
     redirect_to authorization_url(state, code_verifier), allow_other_host: true
   end
+  private :begin_flow
 
   # GET /auth/:provider/callback?code=&state=  (or ?error=)
   def callback
@@ -67,7 +87,17 @@ class SessionOauthController < ApplicationController
 
     result = exchange_code(params[:code], flow["code_verifier"])
     identity = @provider.identity_from(result, client_id: ConsoleAuth.client_id(@key))
-    sign_in_console_user(User.link_or_provision(provider: @key, identity: identity))
+
+    if state["mode"] == "link"
+      complete_link(identity)
+    else
+      # Login must never accept a link-only provider, even if a stale/forged
+      # login state names one.
+      if ConsoleAuth.link_only?(@key)
+        return redirect_to login_path, alert: "That sign-in method is not available."
+      end
+      sign_in_console_user(User.link_or_provision(provider: @key, identity: identity))
+    end
   rescue Broker::ExchangeError => e
     Rails.logger.error { "console login exchange failed (#{@key}): #{e.reason}" }
     redirect_to login_path, alert: "Sign in failed. Please try again."
@@ -132,5 +162,23 @@ class SessionOauthController < ApplicationController
 
   def invalid_flow
     redirect_to login_path, alert: "This sign-in link is invalid or expired. Start again."
+  end
+
+  # Attaches the linked identity to the operator who started the connect flow.
+  # The session (established via the login provider) is the trust anchor, so we
+  # require a live current_user and never provision or switch accounts. A
+  # link-only guard is defensive: only link-only providers should reach here.
+  def complete_link(identity)
+    user = current_user
+    return invalid_flow if user.nil?
+    unless ConsoleAuth.link_only?(@key)
+      return redirect_to console_integrations_path, alert: "That account can't be linked."
+    end
+
+    user.link_identity!(provider: @key, identity: identity)
+    redirect_to console_integrations_path, notice: "Linked your #{@key.capitalize} account."
+  rescue User::IdentityConflict
+    redirect_to console_integrations_path,
+                alert: "That #{@key.capitalize} account is already linked to another user."
   end
 end
