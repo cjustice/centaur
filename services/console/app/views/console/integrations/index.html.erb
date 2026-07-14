@@ -4,6 +4,42 @@
            title: "Integrations",
            subtitle: "Connect your accounts so Centaur can act on your behalf." %>
 
+<% if @linkable_login_providers.present? %>
+  <section class="mb-8">
+    <h2 class="mb-1 text-sm font-semibold text-zinc-200">Linked accounts</h2>
+    <p class="mb-4 text-xs text-zinc-500">
+      Link a sign-in identity to this account so the console can show the
+      conversations you started there. This only links to your signed-in
+      account -- it never signs anyone in.
+    </p>
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <% @linkable_login_providers.each do |provider| %>
+        <% identity = @linked_identities_by_provider[provider] %>
+        <div class="console-panel flex flex-col gap-3 p-5">
+          <div class="flex items-center gap-3">
+            <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-ink-700 text-xs font-semibold uppercase tracking-wide text-zinc-300"><%= provider.first(2) %></span>
+            <div class="min-w-0">
+              <div class="truncate text-sm font-semibold text-zinc-100"><%= provider.capitalize %></div>
+              <div class="text-[11px] uppercase tracking-wide text-zinc-500">Sign-in identity</div>
+            </div>
+          </div>
+          <div class="mt-auto flex items-center justify-between gap-3 pt-1">
+            <% if identity %>
+              <%= button_to "Disconnect", console_identity_path(identity), method: :delete, class: "btn-secondary" %>
+              <span class="flex items-center gap-1.5 text-xs text-emerald-300" title="<%= identity.email %>">
+                <span class="size-1.5 rounded-full bg-emerald-400"></span>
+                Linked
+              </span>
+            <% else %>
+              <a href="<%= auth_connect_path(provider: provider) %>" class="btn-primary inline-block">Connect</a>
+            <% end %>
+          </div>
+        </div>
+      <% end %>
+    </div>
+  </section>
+<% end %>
+
 <% if @oauth_apps.empty? %>
   <p class="empty-state">No integrations available yet.</p>
 <% else %>

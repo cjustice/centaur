@@ -97,6 +97,7 @@ The operator console always supports email and password sign-in. To add Google o
 | `CENTAUR_CONSOLE_SLACK_CLIENT_ID`        | for Slack | Slack OpenID Connect client ID for console login.                                            |
 | `CENTAUR_CONSOLE_SLACK_CLIENT_SECRET`    | for Slack | Slack OpenID Connect client secret for console login.                                        |
 | `CENTAUR_CONSOLE_BOOTSTRAP_ADMINS`       | no       | Comma- or whitespace-separated email allowlist. Matching users become active admins on first SSO login. Other SSO users become active non-admin operators and land on the console directly -- the deployment's network boundary is the access control, there is no approval queue. |
+| `CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS`    | no       | Comma- or whitespace-separated provider list (`google`, `slack`) that may only be **linked to an already-signed-in account**, never used to log in. A link-only provider is hidden from the login page and rejected by the login flow; instead it appears as a "Connect" button on the Integrations page. Empty by default (every configured provider can log in). |
 
 Register these callback URLs with the provider:
 
@@ -104,6 +105,10 @@ Register these callback URLs with the provider:
 - Slack: `<CENTAUR_CONSOLE_PUBLIC_URL>/auth/slack/callback`
 
 Both providers request the `openid`, `email`, and `profile` scopes. Client credentials may also be stored in Rails credentials under `console_auth.<provider>.client_id` and `console_auth.<provider>.client_secret`, but environment variables take precedence.
+
+### Link-only providers
+
+By default any configured provider can both log in and be linked. Listing a provider in `CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS` restricts it to **account linking only**: it never provisions or authenticates a user, so it cannot widen who can reach the console. A signed-in operator links it from **Integrations → Linked accounts** (which runs the same OIDC flow but attaches the returned identity to the current account); an operator can only claim an IdP account they can actually sign into, and an account already linked to another user is rejected. This is the recommended setup when you want, say, Google to remain the sole login/access gate while still linking Slack identities so the console can scope the threads each operator opened from Slack.
 
 Google OAuth consent apps for broker credentials are configured separately in the console under **OAuth Apps**. Those app callbacks use `/oauth/<slug>/callback` and currently support Google only; Slack support here applies to operator console sign-in.
 

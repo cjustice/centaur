@@ -17,7 +17,7 @@
     <div class="alert-error"><%= flash[:alert] %></div>
   <% end %>
 
-  <% providers = ConsoleAuth.providers %>
+  <% providers = ConsoleAuth.login_providers %>
   <% if providers.any? %>
     <div class="space-y-3">
       <% providers.each do |provider| %>

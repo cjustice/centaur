@@ -19,9 +19,38 @@ module ConsoleAuth
 
   module_function
 
-  # Configured + supported provider keys, for the login page buttons.
+  # Configured + supported provider keys.
   def providers
     SUPPORTED.select { |p| configured?(p) }
+  end
+
+  # Providers offered on the login page: every configured provider that is not
+  # marked link-only. Login-capable providers can authenticate AND provision a
+  # user; link-only providers cannot log anyone in (see #link_only_providers).
+  def login_providers
+    providers.reject { |p| link_only?(p) }
+  end
+
+  # Configured providers that may only be linked to an already-authenticated
+  # account (never used to log in or provision). These are what the console
+  # offers as "Connect" buttons on the Integrations page.
+  def linkable_providers
+    providers.select { |p| link_only?(p) }
+  end
+
+  # Whether a configured provider is link-only. Controlled by
+  #   CENTAUR_CONSOLE_LINK_ONLY_PROVIDERS="slack"   (comma/space list, ENV)
+  #   credentials.console_auth.link_only_providers   (fallback: string or array)
+  # Empty by default, so a deployment that configures a provider keeps today's
+  # behavior (it logs in) unless it opts that provider into link-only.
+  def link_only?(provider)
+    link_only_providers.include?(provider.to_s.strip.downcase)
+  end
+
+  def link_only_providers
+    raw = ConsoleEnv["LINK_ONLY_PROVIDERS"].presence || credentials_dig(:link_only_providers)
+    list = raw.is_a?(Array) ? raw : raw.to_s.split(/[,\s]+/)
+    list.map { |p| p.to_s.strip.downcase }.reject(&:empty?).select { |p| SUPPORTED.include?(p) }.uniq
   end
 
   def configured?(provider)

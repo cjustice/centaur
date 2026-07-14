@@ -21,5 +21,14 @@ class Console::IntegrationsController < ApplicationController
       .where(oauth_app_id: @oauth_apps.select(:id))
       .order(:updated_at)
       .index_by(&:oauth_app_id)
+
+    # Link-only SSO providers (e.g. Slack) the operator can attach to their
+    # account for thread/credential scoping, plus the identities they've already
+    # linked. Empty unless the deployment configures a link-only provider, so
+    # the "Linked accounts" section is hidden by default.
+    @linkable_login_providers = ConsoleAuth.linkable_providers
+    @linked_identities_by_provider = current_user.user_identities
+      .where(provider: @linkable_login_providers)
+      .index_by(&:provider)
   end
 end
