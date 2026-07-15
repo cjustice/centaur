@@ -110,7 +110,7 @@ result = await ctx.agent_turn(
     "Investigate this alert and return the next action.",
     thread_key=f"workflow:{ctx.run_id}:agent",
     harness="codex",
-    model="claude-opus-4-8",
+    model="gpt-5.2",
     reasoning="high",
     metadata={"workflow": WORKFLOW_NAME},
 )
@@ -137,12 +137,16 @@ To set a default for **every** turn in a workflow, declare a module-level
 
 ```python
 WORKFLOW_NAME = "nightly_report"
-AGENT_DEFAULTS = {"model": "claude-opus-4-8", "reasoning": "high"}
+AGENT_DEFAULTS = {"harness": "codex", "model": "gpt-5.2", "reasoning": "high"}
 
 async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
-    await ctx.agent_turn("Draft the report.")            # opus @ high
-    await ctx.agent_turn("Tidy formatting.", reasoning="low")  # opus @ low
+    await ctx.agent_turn("Draft the report.")            # gpt-5.2 @ high
+    await ctx.agent_turn("Tidy formatting.", reasoning="low")  # gpt-5.2 @ low
 ```
+
+Keep `harness` and `model` together — a model is only meaningful within its
+harness, and because kwargs override `AGENT_DEFAULTS` key by key, overriding one
+without the other can strand a model on the wrong harness.
 
 ### Declare webhook metadata in the workflow
 
