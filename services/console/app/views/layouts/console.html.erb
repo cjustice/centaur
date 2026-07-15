@@ -1994,14 +1994,28 @@
         const shell = document.getElementById("console-shell");
         const toggle = document.querySelector("[data-console-nav-toggle]");
         const scrim = document.querySelector("[data-console-nav-scrim]");
-        if (!shell || !toggle) return;
+        const sidebar = shell && shell.querySelector(".console-sidebar");
+        if (!shell || !toggle || !sidebar) return;
 
         const OPEN_CLASS = "console-nav-open";
+        // Mirrors the CSS breakpoint: only in the off-canvas range does a
+        // closed drawer need to be pulled out of the tab / assistive-tech order.
+        const mobileQuery = window.matchMedia("(max-width: 768px)");
 
         const isOpen = () => shell.classList.contains(OPEN_CLASS);
+
+        // Off-canvas and closed => hide the sidebar from keyboard and assistive
+        // tech: it sits before the page in DOM order, so leaving it merely
+        // translated off-screen makes users tab through invisible controls
+        // first. Desktop and the open drawer stay fully interactive.
+        const syncInert = () => {
+          sidebar.inert = mobileQuery.matches && !isOpen();
+        };
+
         const setOpen = (open) => {
           shell.classList.toggle(OPEN_CLASS, open);
           toggle.setAttribute("aria-expanded", String(open));
+          syncInert();
         };
 
         toggle.addEventListener("click", () => setOpen(!isOpen()));
@@ -2011,17 +2025,24 @@
           if (event.key === "Escape" && isOpen()) setOpen(false);
         });
 
-        // Any navigation within the drawer (section links, thread rows, the
-        // brand/account controls) should dismiss it once the visit starts.
+        // Only real navigations should dismiss the drawer. Links (section nav,
+        // thread rows, the brand) qualify; in-drawer buttons that open a menu
+        // or reveal more rows (account menu, theme toggle, "show more") must
+        // not, or they'd slam the drawer shut before doing anything. Form
+        // buttons that submit (sign out, view as operator) trigger a full
+        // navigation, which the turbo listeners below already close on.
         shell.addEventListener("click", (event) => {
           if (!isOpen()) return;
-          if (event.target.closest(".console-sidebar a, .console-sidebar button")) {
+          if (event.target.closest(".console-sidebar a[href]")) {
             setOpen(false);
           }
         });
 
+        mobileQuery.addEventListener("change", syncInert);
         document.addEventListener("turbo:visit", () => setOpen(false));
         document.addEventListener("turbo:load", () => setOpen(false));
+
+        syncInert();
       })();
 
       (() => {
