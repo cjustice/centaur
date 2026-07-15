@@ -570,12 +570,16 @@ describe('slackbotv2', () => {
     expect(JSON.parse(executeBody.input_lines.at(-1)!).model).toBeUndefined()
   })
 
-  it('forwards a per-channel default model and reasoning effort onto the input line', async () => {
+  it('forwards a per-channel default harness + model + reasoning onto the turn', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     bot = createTestBot({
       state: sharedState,
-      channelDefaults: { [CHANNEL_ID]: { model: 'gpt-5.2', reasoning: 'high' } }
+      // The channel pins the harness and its model together (as `--claude
+      // --model opus -rsn high` would parse), so the pair can't mismatch.
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
     })
 
     const parent = await postUserMessage('Channel default thread context.')
@@ -601,27 +605,31 @@ describe('slackbotv2', () => {
     expect(response.status).toBe(200)
     await Promise.all(waits)
 
-    // No explicit --model/-rsn, but the channel default rides the input line
-    // (unlike the deployment/baked default) and is recorded for the Console.
+    // No explicit flags, but the channel default selects the harness and rides
+    // the model/reasoning onto the input line (unlike the deployment/baked
+    // default) and is recorded for the Console.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['claudecode'])
     expect(codexApi.executes).toHaveLength(1)
     const executeBody = codexApi.executes[0]!.body
     const inputLine = JSON.parse(executeBody.input_lines.at(-1)!) as Record<string, unknown>
-    expect(inputLine.model).toBe('gpt-5.2')
+    expect(inputLine.model).toBe('claude-opus-4-8')
     expect(inputLine.reasoning).toBe('high')
-    expect(executeBody.metadata.model).toBe('gpt-5.2')
+    expect(executeBody.metadata.model).toBe('claude-opus-4-8')
   })
 
-  it('lets an explicit --model/-rsn override win over the per-channel default', async () => {
+  it('lets an explicit per-thread flag override the per-channel default harness + model', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     bot = createTestBot({
       state: sharedState,
-      channelDefaults: { [CHANNEL_ID]: { model: 'gpt-5.2', reasoning: 'high' } }
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
     })
 
     const parent = await postUserMessage('Channel default override thread context.')
     const mention = await postUserMessage(
-      `<@${BOT_USER_ID}> --model gpt-5.4 -rsn low go`,
+      `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`,
       parent.ts
     )
     const waits: Promise<unknown>[] = []
@@ -636,7 +644,7 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: mention.ts,
           thread_ts: parent.ts,
-          text: `<@${BOT_USER_ID}> --model gpt-5.4 -rsn low go`
+          text: `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`
         }
       }),
       {},
@@ -645,6 +653,8 @@ describe('slackbotv2', () => {
     expect(response.status).toBe(200)
     await Promise.all(waits)
 
+    // Explicit --codex/--model/-rsn beat every field of the channel default.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
     expect(codexApi.executes).toHaveLength(1)
     const inputLine = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<
       string,
@@ -652,6 +662,73 @@ describe('slackbotv2', () => {
     >
     expect(inputLine.model).toBe('gpt-5.4')
     expect(inputLine.reasoning).toBe('low')
+  })
+
+  it('a harness-only override does not drag the channel default model onto the new harness', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Harness-switch thread context.')
+    // Switch to codex with no model. The channel's Claude model must NOT ride
+    // onto codex; switching harness clears the previous harness's model.
+    const first = await postUserMessage(`<@${BOT_USER_ID}> --codex look into this`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-1',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: first.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --codex look into this`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    await Promise.all(firstWaits)
+
+    // A follow-up with no flags: the cleared model must stay cleared (the sticky
+    // tombstone persists), not resurface from the channel default.
+    const second = await postUserMessage(`<@${BOT_USER_ID}> keep going`, parent.ts)
+    const secondWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-2',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: second.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> keep going`
+        }
+      }),
+      {},
+      waitUntilContext(secondWaits)
+    )
+    await Promise.all(secondWaits)
+
+    // Both turns run on codex (the second inherits the sticky harness); neither
+    // forwards a model — the channel's Claude model never leaks onto codex.
+    expect(codexApi.creates.map(c => c.body.harness_type)).toEqual(['codex', 'codex'])
+    expect(codexApi.executes).toHaveLength(2)
+    for (const execute of codexApi.executes) {
+      const line = JSON.parse(execute.body.input_lines.at(-1)!) as Record<string, unknown>
+      expect(line.model).toBeUndefined()
+    }
   })
 
   it('includes all preceding Slack thread messages for a first mid-thread mention', async () => {

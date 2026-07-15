@@ -12,28 +12,64 @@ describe('parseChannelDefaults', () => {
     expect(parseChannelDefaults('   ')).toEqual({})
   })
 
-  test('parses model and reasoning per channel and trims values', () => {
+  test('normalizes each channel object through the shared flag vocabulary', () => {
     const parsed = parseChannelDefaults(
       JSON.stringify({
-        C0ENG: { model: ' claude-opus-4-8 ', reasoning: 'high' },
-        C0TRIAGE: { reasoning: 'low' }
+        C0ENG: { harness: 'claude', model: 'opus', reasoning: 'high' },
+        C0TRIAGE: { harness: 'codex', reasoning: 'low' },
+        C0BEDROCK: { provider: 'bedrock', model: 'gpt-5.2' }
       })
     )
     expect(parsed).toEqual({
-      C0ENG: { model: 'claude-opus-4-8', reasoning: 'high' },
+      // `claude` -> wire harness, `opus` -> full model id.
+      C0ENG: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' },
+      C0TRIAGE: { harnessType: 'codex', reasoning: 'low' },
+      // A provider shortcut implies its harness, mirroring `--bedrock`.
+      C0BEDROCK: { harnessType: 'codex', model: 'gpt-5.2', provider: 'amazon-bedrock' }
+    })
+  })
+
+  test('allows reasoning alone, with no harness or model', () => {
+    expect(parseChannelDefaults(JSON.stringify({ C0TRIAGE: { reasoning: 'low' } }))).toEqual({
       C0TRIAGE: { reasoning: 'low' }
     })
   })
 
-  test('skips entries with no usable model or reasoning', () => {
+  test('expands a model alias but leaves the harness to the explicit field', () => {
+    // Like `--model opus` (not `--opus`): fields are independent, so a model
+    // with no `harness` inherits the thread/deployment harness rather than one
+    // guessed from the model name.
+    expect(
+      parseChannelDefaults(JSON.stringify({ C0A: { model: 'opus' }, C0B: { model: 'gpt-5.2' } }))
+    ).toEqual({
+      C0A: { model: 'claude-opus-4-8' },
+      C0B: { model: 'gpt-5.2' }
+    })
+  })
+
+  test('reports unknown field values and skips an entry that resolves to nothing', () => {
+    const reasons: string[] = []
     const parsed = parseChannelDefaults(
       JSON.stringify({
-        C0EMPTY: {},
-        C0BLANK: { model: '   ', reasoning: '' },
-        C0OK: { model: 'gpt-5.2' }
-      })
+        C0BAD: { harness: 'gpt', reasoning: 'turbo' },
+        C0OK: { harness: 'codex' }
+      }),
+      reason => reasons.push(reason)
     )
-    expect(parsed).toEqual({ C0OK: { model: 'gpt-5.2' } })
+    expect(parsed).toEqual({ C0OK: { harnessType: 'codex' } })
+    expect(reasons.some(r => r.includes('C0BAD') && r.includes('unknown harness'))).toBe(true)
+    expect(reasons.some(r => r.includes('C0BAD') && r.includes('unknown reasoning'))).toBe(true)
+    expect(reasons.some(r => r.includes('C0BAD') && r.includes('no usable'))).toBe(true)
+  })
+
+  test('reports and skips a non-object entry', () => {
+    const reasons: string[] = []
+    const parsed = parseChannelDefaults(
+      JSON.stringify({ C0ENG: '--claude', C0OK: { harness: 'codex' } }),
+      reason => reasons.push(reason)
+    )
+    expect(parsed).toEqual({ C0OK: { harnessType: 'codex' } })
+    expect(reasons.some(r => r.includes('C0ENG') && r.includes('expected an object'))).toBe(true)
   })
 
   test('reports and ignores invalid JSON without throwing', () => {
@@ -65,12 +101,12 @@ describe('channelIdFromThreadId', () => {
 })
 
 describe('resolveChannelDefault', () => {
-  const defaults = { C0ENG: { model: 'claude-opus-4-8', reasoning: 'high' } }
+  const defaults = { C0ENG: { harnessType: 'claudecode', model: 'claude-opus-4-8' } }
 
   test('returns the default for a matching channel', () => {
     expect(resolveChannelDefault(defaults, 'slack:C0ENG:1700000000.0001')).toEqual({
-      model: 'claude-opus-4-8',
-      reasoning: 'high'
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-8'
     })
   })
 

@@ -33,7 +33,7 @@ const options: SlackbotV2Options = {
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
   channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
-    consoleLogger.warn('slackbotv2 ignoring SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
+    consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
   ),
   consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   codexDefaultReasoningEffort: optionalEnv('CODEX_MODEL_REASONING_EFFORT'),

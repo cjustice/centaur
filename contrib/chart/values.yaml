@@ -475,14 +475,18 @@ slackbotv2:
   mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
-  # Per-channel default model / reasoning effort, keyed by Slack conversation
-  # id (the C…/G…/D… id). Applied when a message in that channel carries no
-  # explicit --model/-rsn override, below such an override and above the
-  # deployment/baked harness default, and forwarded onto the harness input line
-  # so it takes effect. Set a model compatible with the deployment's default
-  # harness; reasoning only affects the codex harness. Example:
+  # Per-channel default harness / model / provider / reasoning, keyed by Slack
+  # conversation id (the C…/G…/D… id). Each value is an object of optional
+  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # the inline Slack flags (harness: claude|codex|amp, provider: bedrock|meta,
+  # model accepts Claude aliases like opus). A model is only meaningful within a
+  # harness, so name the harness alongside it. Applied when a message in that
+  # channel carries no explicit/sticky per-thread flag, below such a flag and
+  # above the deployment/baked harness default, and forwarded onto the harness
+  # input line so it takes effect. reasoning only affects the codex harness.
+  # Example:
   #   channelDefaults:
-  #     C0ENG: { model: claude-opus-4-8, reasoning: high }
+  #     C0ENG: { harness: claude, model: opus, reasoning: high }
   #     C0TRIAGE: { reasoning: low }
   channelDefaults: {}
   metrics:

@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
+import type { ChannelDefaults } from './channel-defaults'
 import type { SlackDisplayTextSource } from './slack-display-text'
 
 export type JsonPrimitive = string | number | boolean | null
@@ -122,13 +123,10 @@ export type SlackbotV2Options = {
   /** Codex effort displayed in Slack when no per-turn `-rsn` override is set. */
   codexDefaultReasoningEffort?: string
   /**
-   * Per-channel default model / reasoning effort, keyed by Slack conversation
-   * id, from the SLACKBOTV2_CHANNEL_DEFAULTS env var (JSON). Applied below an
-   * explicit --model/-rsn override and above the deployment/baked default, and
-   * forwarded onto the harness input line so it takes effect. See
-   * channel-defaults.ts.
+   * Per-channel default harness/model/provider/reasoning, keyed by Slack
+   * conversation id (SLACKBOTV2_CHANNEL_DEFAULTS). See channel-defaults.ts.
    */
-  channelDefaults?: Record<string, { model?: string; reasoning?: string }>
+  channelDefaults?: ChannelDefaults
   /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
    * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
