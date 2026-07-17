@@ -27,8 +27,8 @@ module Mcp
         grant_types_supported: McpOauthClient::DEFAULT_GRANT_TYPES,
         code_challenge_methods_supported: [ "S256" ],
         token_endpoint_auth_methods_supported: [ "none" ],
-        scopes_supported: McpOauthClient::DEFAULT_SCOPES,
-        resource_parameter_supported: true
+        scopes_supported: McpOauthClient::SUPPORTED_SCOPES,
+        resource_indicators_supported: true
       }
     end
 
@@ -142,13 +142,21 @@ module Mcp
         return authorization_request_error(client, :invalid_request, "code_challenge is required.")
       end
 
-      scopes = normalize_scope_param(params[:scope], McpOauthClient::DEFAULT_SCOPES)
-      unsupported = scopes - McpOauthClient::DEFAULT_SCOPES
+      scopes = normalize_scope_param(params[:scope], client.scopes)
+      unsupported = scopes - McpOauthClient::SUPPORTED_SCOPES
       if unsupported.any?
         return authorization_request_error(
           client,
           :invalid_scope,
           "Unsupported scope: #{unsupported.join(' ')}."
+        )
+      end
+      unauthorized = scopes - client.scopes
+      if unauthorized.any?
+        return authorization_request_error(
+          client,
+          :invalid_scope,
+          "Client is not registered for scope: #{unauthorized.join(' ')}."
         )
       end
 

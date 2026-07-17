@@ -22,6 +22,18 @@ class McpOauthClientTest < ActiveSupport::TestCase
   test "allowed redirect URI rejects fragments" do
     refute McpOauthClient.allowed_redirect_uri?("https://example.com/callback#token")
   end
+  test "agent execution is a supported MCP OAuth scope" do
+    client = McpOauthClient.new(
+      name: "OMP",
+      redirect_uris: [ "http://127.0.0.1/callback" ],
+      grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
+      response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
+      scopes: %w[mcp:tools agents:execute]
+    )
+
+    assert client.valid?
+  end
+
 
   test "redirect matching rejects attacker controlled 127-looking hostnames" do
     client = McpOauthClient.create!(

@@ -6,7 +6,8 @@ class McpOauthClient < ApplicationRecord
 
   DEFAULT_GRANT_TYPES = %w[authorization_code refresh_token].freeze
   DEFAULT_RESPONSE_TYPES = %w[code].freeze
-  DEFAULT_SCOPES = %w[mcp:tools].freeze
+  SUPPORTED_SCOPES = %w[mcp:tools agents:execute].freeze
+  DEFAULT_SCOPES = SUPPORTED_SCOPES
 
   has_many :authorization_codes, class_name: "McpOauthAuthorizationCode", dependent: :destroy
   has_many :refresh_tokens, class_name: "McpOauthRefreshToken", dependent: :destroy
@@ -60,7 +61,7 @@ class McpOauthClient < ApplicationRecord
 
   def scopes_supported
     return errors.add(:scopes, "must be an array") unless scopes.is_a?(Array)
-    unsupported = scopes - DEFAULT_SCOPES
+    unsupported = scopes - SUPPORTED_SCOPES
     errors.add(:scopes, "contains unsupported values: #{unsupported.join(', ')}") if unsupported.any?
   end
 
