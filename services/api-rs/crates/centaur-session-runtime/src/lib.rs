@@ -311,12 +311,40 @@ enum SessionPrincipalSource<'a> {
     Existing(&'a str),
 }
 
+fn is_mcp_agent_thread(thread_key: &ThreadKey) -> bool {
+    thread_key.as_str().starts_with("mcp-agent:")
+}
+
+fn reject_mcp_agent_raw_thread(thread_key: &ThreadKey) -> Result<(), SessionRuntimeError> {
+    if is_mcp_agent_thread(thread_key) {
+        return Err(SessionRuntimeError::BadRequest(
+            "mcp-agent threads require MCP-specific runtime APIs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_principal(
+    session: &Session,
+    principal_id: &str,
+) -> Result<(), SessionRuntimeError> {
+    match session.iron_control_principal.as_deref() {
+        Some(persisted) if persisted == principal_id => Ok(()),
+        Some(_) => Err(SessionRuntimeError::BadRequest(
+            "session principal does not match authenticated caller".to_owned(),
+        )),
+        None => Err(SessionRuntimeError::BadRequest(
+            "session is missing persisted principal".to_owned(),
+        )),
+    }
+}
+
 fn validate_session_principal_source(
     thread_key: &ThreadKey,
     principal_source: SessionPrincipalSource<'_>,
 ) -> Result<(), SessionRuntimeError> {
     if matches!(principal_source, SessionPrincipalSource::Derived)
-        && thread_key.as_str().starts_with("mcp-agent:")
+        && is_mcp_agent_thread(thread_key)
     {
         return Err(SessionRuntimeError::BadRequest(
             "mcp-agent threads require an existing external principal".to_owned(),
@@ -1359,6 +1387,7 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         self.create_or_get_session_with_principal(
             thread_key,
             harness_type,
@@ -1508,11 +1537,46 @@ impl SessionRuntime {
                     .await?;
             }
             if let Some(principal) = resolved_principal {
+                if let SessionPrincipalSource::Existing(principal_id) = principal_source
+                    && let Some(persisted) = session.iron_control_principal.as_deref()
+                    && persisted != principal_id
+                {
+                    return Err(SessionRuntimeError::BadRequest(
+                        "session principal does not match authenticated caller".to_owned(),
+                    ));
+                }
                 // Persist the principal OID on the session row so a resumed session
                 // can recreate its sandbox after a restart without re-deriving it.
                 let session = self
                     .store
                     .set_iron_control_principal(thread_key, Some(&principal.id))
+                    .await?;
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_create_or_get_completed",
+                    thread_key = %thread_key,
+                    harness_type = %harness_type,
+                    status = %session.status,
+                    iron_control_principal_persisted = true,
+                    harness_switched,
+                    "session ready"
+                );
+                return Ok(CreateOrGetSessionOutcome {
+                    session,
+                    harness_switched,
+                });
+            }
+            if let SessionPrincipalSource::Existing(principal_id) = principal_source {
+                if let Some(persisted) = session.iron_control_principal.as_deref()
+                    && persisted != principal_id
+                {
+                    return Err(SessionRuntimeError::BadRequest(
+                        "session principal does not match authenticated caller".to_owned(),
+                    ));
+                }
+                let session = self
+                    .store
+                    .set_iron_control_principal(thread_key, Some(principal_id))
                     .await?;
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
@@ -1619,6 +1683,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1884,6 +1949,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         self.execute_session_with_initial_messages(thread_key, input, None)
             .await
     }
@@ -1897,6 +1963,31 @@ impl SessionRuntime {
         input: ExecuteSessionInput,
         messages: &[SessionMessageInput],
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        if messages.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "messages must not be empty".to_owned(),
+            ));
+        }
+        self.execute_session_with_initial_messages(thread_key, input, Some(messages))
+            .await
+    }
+
+    pub async fn execute_external_session_with_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        messages: &[SessionMessageInput],
+        principal_id: &str,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
         if messages.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
                 "messages must not be empty".to_owned(),
@@ -2190,6 +2281,16 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         execution_id: Option<&str>,
     ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.execution_status_unchecked(thread_key, execution_id)
+            .await
+    }
+
+    async fn execution_status_unchecked(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: Option<&str>,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
         let latest = self.store.latest_execution_for_thread(thread_key).await?;
         if execution_id.is_none()
             || latest
@@ -2215,6 +2316,51 @@ impl SessionRuntime {
                 "session.execution_cancelled" => Some(ExecutionStatus::Cancelled),
                 _ => None,
             }))
+    }
+
+    pub async fn external_execution_status(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        Ok(self
+            .store
+            .execution_for_thread(thread_key, execution_id)
+            .await?
+            .map(|execution| execution.status))
+    }
+
+    pub async fn external_terminal_event_observed(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        status: &ExecutionStatus,
+        principal_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        let Some(event_type) = terminal_event_type_for_status(status) else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .execution_event_exists(execution_id, event_type)
+            .await?)
     }
 
     async fn record_execution_failure(
@@ -2343,13 +2489,54 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         reason: &str,
     ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
             return Ok(InterruptExecutionOutcome {
                 interrupted: false,
                 execution_id: None,
             });
         };
+        self.interrupt_execution(thread_key, execution, reason)
+            .await
+    }
 
+    pub async fn interrupt_external_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        reason: &str,
+        principal_id: &str,
+    ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
+            return Ok(InterruptExecutionOutcome {
+                interrupted: false,
+                execution_id: None,
+            });
+        };
+        if execution.execution_id != execution_id {
+            return Ok(InterruptExecutionOutcome {
+                interrupted: false,
+                execution_id: Some(execution_id.to_owned()),
+            });
+        }
+        self.interrupt_execution(thread_key, execution, reason)
+            .await
+    }
+
+    async fn interrupt_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution: SessionExecution,
+        reason: &str,
+    ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
         let execution_span = self
             .execution_spans
             .lock()
@@ -2468,6 +2655,7 @@ impl SessionRuntime {
             execution_id = execution_id.unwrap_or(""),
         );
         let result = async {
+            reject_mcp_agent_raw_thread(thread_key)?;
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_events_stream_started",
@@ -3253,6 +3441,38 @@ impl SessionRuntime {
     }
 
     pub async fn list_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.list_events_unchecked(thread_key, after_event_id, execution_id, limit)
+            .await
+    }
+
+    pub async fn list_external_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+        principal_id: &str,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        self.list_events_unchecked(thread_key, after_event_id, execution_id, limit)
+            .await
+    }
+
+    async fn list_events_unchecked(
         &self,
         thread_key: &ThreadKey,
         after_event_id: i64,
@@ -4055,6 +4275,15 @@ fn is_terminal_execution_event(event_type: &str) -> bool {
         event_type,
         "session.execution_completed" | "session.execution_failed" | "session.execution_cancelled"
     )
+}
+
+fn terminal_event_type_for_status(status: &ExecutionStatus) -> Option<&'static str> {
+    match status {
+        ExecutionStatus::Completed => Some("session.execution_completed"),
+        ExecutionStatus::Failed => Some("session.execution_failed"),
+        ExecutionStatus::Cancelled => Some("session.execution_cancelled"),
+        ExecutionStatus::Queued | ExecutionStatus::Running => None,
+    }
 }
 
 /// How a stdout pump pass ended once the attach stream closed.
@@ -6895,6 +7124,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_runtime_entrypoints_reject_mcp_agent_threads() {
+        let mcp_thread = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+
+        assert!(reject_mcp_agent_raw_thread(&mcp_thread).is_err());
+    }
+
+    #[test]
+    fn external_principal_validation_rejects_cross_principal_session() {
+        let now = OffsetDateTime::now_utc();
+        let session = Session {
+            thread_key: ThreadKey::parse("mcp-agent:principal:request").unwrap(),
+            title: None,
+            sandbox_id: None,
+            sandbox_capabilities: None,
+            harness_type: HarnessType::Codex,
+            harness_thread_id: None,
+            persona_id: None,
+            status: SessionStatus::Idle,
+            iron_control_principal: Some("principal-a".to_owned()),
+            sandbox_last_active_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(validate_external_principal(&session, "principal-a").is_ok());
+        assert!(validate_external_principal(&session, "principal-b").is_err());
+    }
+    #[test]
     fn sandbox_repo_cache_label_controls_access() {
         assert_eq!(
             sandbox_repo_cache_access_from_principal(&test_principal(
@@ -8684,6 +8941,169 @@ mod adoption_tests {
             ["GET /api/v1/principals/prn_mcp_caller HTTP/1.1"]
         );
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_stream_events_rejects_mcp_agent_threads() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("mcp-agent:test:stream-{}", uuid::Uuid::new_v4())).unwrap();
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let error = match runtime.stream_events(&thread_key, 0, None).await {
+            Ok(_) => panic!("raw stream_events must reject mcp-agent threads"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SessionRuntimeError::BadRequest(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_external_cancel_does_not_interrupt_newer_active_execution() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("mcp-agent:test:cancel-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let old_execution = store
+            .create_execution(&thread_key, Some("old"), json!({}))
+            .await
+            .expect("create old execution")
+            .execution;
+        store
+            .mark_execution_running(&old_execution.execution_id)
+            .await
+            .expect("mark old running");
+        backdate_execution(&store, &old_execution.execution_id, 10.0).await;
+        let new_execution = store
+            .create_execution(&thread_key, Some("new"), json!({}))
+            .await
+            .expect("create new execution")
+            .execution;
+        store
+            .mark_execution_running(&new_execution.execution_id)
+            .await
+            .expect("mark new running");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let outcome = runtime
+            .interrupt_external_execution(
+                &thread_key,
+                &old_execution.execution_id,
+                "too late",
+                "principal-a",
+            )
+            .await
+            .expect("cancel old execution");
+
+        assert!(!outcome.interrupted);
+        assert_eq!(
+            outcome.execution_id.as_deref(),
+            Some(old_execution.execution_id.as_str())
+        );
+        let delivered = store
+            .list_events_after(&thread_key, 0, Some(&new_execution.execution_id), 100)
+            .await
+            .expect("list new execution events")
+            .into_iter()
+            .any(|event| event.event_type == "session.interrupt_delivered");
+        assert!(!delivered, "new execution must not receive old cancel");
+
+        store
+            .fail_execution_if_active(&old_execution.execution_id, "test cleanup")
+            .await
+            .expect("clean old execution");
+        store
+            .fail_execution_if_active(&new_execution.execution_id, "test cleanup")
+            .await
+            .expect("clean new execution");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_execution_status_survives_cursor_past_terminal_event() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("mcp-agent:test:status-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+        let terminal_event = store
+            .append_event(
+                &thread_key,
+                Some(&execution.execution_id),
+                "session.execution_completed",
+                json!({"execution_id": execution.execution_id}),
+            )
+            .await
+            .expect("append terminal event");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let page = runtime
+            .list_external_events(
+                &thread_key,
+                terminal_event.event_id,
+                Some(&execution.execution_id),
+                100,
+                "principal-a",
+            )
+            .await
+            .expect("list events after terminal cursor");
+        assert!(page.is_empty());
+        assert_eq!(
+            runtime
+                .external_execution_status(&thread_key, &execution.execution_id, "principal-a")
+                .await
+                .expect("read external status"),
+            Some(ExecutionStatus::Completed)
+        );
+        assert!(
+            runtime
+                .external_terminal_event_observed(
+                    &thread_key,
+                    &execution.execution_id,
+                    &ExecutionStatus::Completed,
+                    "principal-a",
+                )
+                .await
+                .expect("check terminal event")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

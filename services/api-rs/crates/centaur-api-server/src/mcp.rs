@@ -114,6 +114,7 @@ struct McpAgentEventsArguments {
 #[derive(Debug, Deserialize)]
 struct McpAgentCancelArguments {
     thread_key: String,
+    execution_id: String,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -296,14 +297,18 @@ fn mcp_agent_tool_entries() -> Vec<Value> {
         }),
         json!({
             "name": "centaur_agent_cancel",
-            "description": "Ask the active Centaur sub-agent execution for a thread to stop.",
+            "description": "Ask one exact active Centaur sub-agent execution for a thread to stop.",
             "inputSchema": {
                 "type": "object",
-                "required": ["thread_key"],
+                "required": ["thread_key", "execution_id"],
                 "properties": {
                     "thread_key": {
                         "type": "string",
                         "description": "mcp-agent thread key returned by centaur_agent_start."
+                    },
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution id returned by centaur_agent_start. Cancellation is ignored if this execution is no longer active."
                     },
                     "reason": {
                         "type": "string",
@@ -537,11 +542,7 @@ async fn mcp_agent_start_result(
         _ if params.thread_key.is_some() => runtime.session(&thread_key).await?.harness_type,
         _ => runtime.default_harness(),
     };
-    let metadata = json!({
-        "mcp_agent": true,
-        "mcp_principal_id": principal.principal_id,
-        "mcp_token_id": principal.token_id,
-    });
+    let metadata = mcp_agent_session_metadata(principal);
     let request_fingerprint = mcp_agent_request_fingerprint(
         &prompt,
         &harness,
@@ -549,12 +550,7 @@ async fn mcp_agent_start_result(
         params.idle_timeout_ms,
         max_duration_ms,
     )?;
-    let execution_metadata = json!({
-        "mcp_agent": true,
-        "mcp_principal_id": principal.principal_id,
-        "mcp_token_id": principal.token_id,
-        "mcp_request_fingerprint": request_fingerprint,
-    });
+    let execution_metadata = mcp_agent_execution_metadata(principal, &request_fingerprint);
     let session = runtime
         .create_or_get_external_session(
             &thread_key,
@@ -565,12 +561,9 @@ async fn mcp_agent_start_result(
             &principal.principal_id,
         )
         .await?;
-    let input_line = serde_json::to_string(&json!({
-        "type": "user",
-        "text": prompt,
-    }))?;
+    let input_line = mcp_agent_input_line(&thread_key, &prompt, &execution_metadata)?;
     let execution = runtime
-        .execute_session_with_messages(
+        .execute_external_session_with_messages(
             &thread_key,
             ExecuteSessionInput {
                 idempotency_key: Some(idempotency_key.clone()),
@@ -588,6 +581,7 @@ async fn mcp_agent_start_result(
                 })],
                 metadata: metadata.clone(),
             }],
+            &principal.principal_id,
         )
         .await?;
     mcp_json_result(json!({
@@ -613,30 +607,50 @@ async fn mcp_agent_events_result(
             "limit must be between 1 and 500".to_owned(),
         ));
     }
-    let mut events = state
-        .runtime()?
-        .list_events(
+    let runtime = state.runtime()?;
+    let mut events = runtime
+        .list_external_events(
             &thread_key,
             params.after_event_id.unwrap_or(0),
             params.execution_id.as_deref(),
             limit + 1,
+            &principal.principal_id,
         )
         .await?;
     let has_more = events.len() > limit as usize;
     events.truncate(limit as usize);
     let last_event_id = events.last().map(|event| event.event_id);
-    let terminal_status = mcp_terminal_status(
-        state
-            .runtime()?
-            .execution_status(&thread_key, params.execution_id.as_deref())
-            .await?,
-    );
+    let execution_status = match params.execution_id.as_deref() {
+        Some(execution_id) => {
+            runtime
+                .external_execution_status(&thread_key, execution_id, &principal.principal_id)
+                .await?
+        }
+        None => None,
+    };
+    let terminal_status = mcp_terminal_status_from_execution_status(execution_status.as_ref());
+    let terminal_event_observed = match (params.execution_id.as_deref(), execution_status.as_ref())
+    {
+        (Some(execution_id), Some(status)) => {
+            mcp_terminal_event_visible_in_events(&events, execution_id, status)
+                || runtime
+                    .external_terminal_event_observed(
+                        &thread_key,
+                        execution_id,
+                        status,
+                        &principal.principal_id,
+                    )
+                    .await?
+        }
+        _ => false,
+    };
     mcp_json_result(json!({
         "thread_key": thread_key,
         "execution_id": params.execution_id,
         "events": events,
         "last_event_id": last_event_id,
         "terminal_status": terminal_status,
+        "terminal_event_observed": terminal_event_observed,
         "has_more": has_more,
     }))
 }
@@ -655,15 +669,38 @@ async fn mcp_agent_cancel_result(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Interrupted from MCP");
+    let execution_id = params.execution_id.trim();
+    if execution_id.is_empty() {
+        return Err(ApiError::BadRequest("execution_id is required".to_owned()));
+    }
     let outcome = state
         .runtime()?
-        .interrupt_active_execution(&thread_key, reason)
+        .interrupt_external_execution(&thread_key, execution_id, reason, &principal.principal_id)
         .await?;
     mcp_json_result(json!({
         "thread_key": thread_key,
         "interrupted": outcome.interrupted,
         "execution_id": outcome.execution_id,
     }))
+}
+
+fn mcp_agent_input_line(
+    thread_key: &ThreadKey,
+    prompt: &str,
+    trace_metadata: &Value,
+) -> Result<String, ApiError> {
+    Ok(serde_json::to_string(&json!({
+        "type": "user",
+        "thread_key": thread_key,
+        "trace_metadata": trace_metadata,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": prompt,
+            }],
+        },
+    }))?)
 }
 
 fn mcp_parse_agent_harness(value: &str) -> Result<HarnessType, ApiError> {
@@ -704,12 +741,51 @@ fn mcp_agent_thread_prefix(principal: &McpPrincipal) -> String {
     format!("mcp-agent:{}:", hex::encode(&digest[..12]))
 }
 
-fn mcp_terminal_status(status: Option<ExecutionStatus>) -> Option<&'static str> {
+fn mcp_agent_session_metadata(principal: &McpPrincipal) -> Value {
+    json!({
+        "mcp_agent": true,
+        "mcp_principal_id": principal.principal_id,
+    })
+}
+
+fn mcp_agent_execution_metadata(principal: &McpPrincipal, request_fingerprint: &str) -> Value {
+    json!({
+        "mcp_agent": true,
+        "mcp_principal_id": principal.principal_id,
+        "mcp_request_fingerprint": request_fingerprint,
+    })
+}
+
+fn mcp_terminal_status_from_execution_status(
+    status: Option<&ExecutionStatus>,
+) -> Option<&'static str> {
     match status {
         Some(ExecutionStatus::Completed) => Some("completed"),
         Some(ExecutionStatus::Failed) => Some("failed"),
         Some(ExecutionStatus::Cancelled) => Some("cancelled"),
         Some(ExecutionStatus::Queued | ExecutionStatus::Running) | None => None,
+    }
+}
+
+fn mcp_terminal_event_visible_in_events(
+    events: &[centaur_session_core::SessionEvent],
+    execution_id: &str,
+    status: &ExecutionStatus,
+) -> bool {
+    let Some(event_type) = mcp_terminal_event_type_for_status(status) else {
+        return false;
+    };
+    events.iter().any(|event| {
+        event.execution_id.as_deref() == Some(execution_id) && event.event_type == event_type
+    })
+}
+
+fn mcp_terminal_event_type_for_status(status: &ExecutionStatus) -> Option<&'static str> {
+    match status {
+        ExecutionStatus::Completed => Some("session.execution_completed"),
+        ExecutionStatus::Failed => Some("session.execution_failed"),
+        ExecutionStatus::Cancelled => Some("session.execution_cancelled"),
+        ExecutionStatus::Queued | ExecutionStatus::Running => None,
     }
 }
 
@@ -1358,6 +1434,32 @@ mod mcp_tests {
             tools[0]["inputSchema"]["required"],
             json!(["prompt", "idempotency_key"])
         );
+        assert_eq!(
+            tools[2]["inputSchema"]["required"],
+            json!(["thread_key", "execution_id"])
+        );
+    }
+
+    #[test]
+    fn mcp_agent_input_uses_harness_user_message_shape() {
+        let thread_key = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let line = mcp_agent_input_line(
+            &thread_key,
+            "inspect the failure",
+            &json!({"source": "mcp"}),
+        )
+        .unwrap();
+        let input: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(input["type"], "user");
+        assert_eq!(input["thread_key"], thread_key.as_str());
+        assert_eq!(input["trace_metadata"], json!({"source": "mcp"}));
+        assert_eq!(input["message"]["role"], "user");
+        assert_eq!(
+            input["message"]["content"],
+            json!([{"type": "text", "text": "inspect the failure"}])
+        );
+        assert!(input.get("text").is_none());
     }
 
     #[test]
@@ -1395,21 +1497,55 @@ mod mcp_tests {
     }
 
     #[test]
-    fn mcp_terminal_status_uses_durable_execution_status() {
+    fn mcp_agent_execution_metadata_survives_token_rotation() {
+        let mut first = test_principal("principal-ada");
+        first.token_id = "token-before-refresh".to_owned();
+        let mut refreshed = test_principal("principal-ada");
+        refreshed.token_id = "token-after-refresh".to_owned();
+
+        let first_metadata = mcp_agent_execution_metadata(&first, "fingerprint-1");
+        let refreshed_metadata = mcp_agent_execution_metadata(&refreshed, "fingerprint-1");
+
+        assert_eq!(first_metadata, refreshed_metadata);
+        assert_eq!(first_metadata["mcp_principal_id"], "principal-ada");
+        assert_eq!(first_metadata["mcp_request_fingerprint"], "fingerprint-1");
+        assert!(first_metadata.get("mcp_token_id").is_none());
+    }
+
+    #[test]
+    fn mcp_terminal_status_uses_execution_status_and_tracks_visible_event() {
+        let thread_key = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let completed = centaur_session_core::SessionEvent {
+            event_id: 10,
+            thread_key: thread_key.clone(),
+            execution_id: Some("exec-1".to_owned()),
+            event_type: "session.execution_completed".to_owned(),
+            payload: json!({"execution_id": "exec-1"}),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let output = centaur_session_core::SessionEvent {
+            event_id: 9,
+            thread_key,
+            execution_id: Some("exec-1".to_owned()),
+            event_type: "session.output.line".to_owned(),
+            payload: json!("done"),
+            created_at: OffsetDateTime::now_utc(),
+        };
+
         assert_eq!(
-            mcp_terminal_status(Some(ExecutionStatus::Completed)),
+            mcp_terminal_status_from_execution_status(Some(&ExecutionStatus::Completed)),
             Some("completed")
         );
-        assert_eq!(
-            mcp_terminal_status(Some(ExecutionStatus::Failed)),
-            Some("failed")
-        );
-        assert_eq!(
-            mcp_terminal_status(Some(ExecutionStatus::Cancelled)),
-            Some("cancelled")
-        );
-        assert_eq!(mcp_terminal_status(Some(ExecutionStatus::Running)), None);
-        assert_eq!(mcp_terminal_status(None), None);
+        assert!(!mcp_terminal_event_visible_in_events(
+            &[output],
+            "exec-1",
+            &ExecutionStatus::Completed,
+        ));
+        assert!(mcp_terminal_event_visible_in_events(
+            &[completed],
+            "exec-1",
+            &ExecutionStatus::Completed,
+        ));
     }
 
     #[test]
