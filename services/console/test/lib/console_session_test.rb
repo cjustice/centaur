@@ -43,6 +43,16 @@ class ConsoleSessionTest < ActiveSupport::TestCase
     assert_equal 3600, ConsoleSession.expire_after
   end
 
+  test "parses base 10, so a leading zero is not treated as octal" do
+    ENV["CENTAUR_CONSOLE_SESSION_MAX_AGE"] = "010"
+    assert_equal 10, ConsoleSession.expire_after
+  end
+
+  test "rejects non-decimal (hex/octal-prefixed) values" do
+    ENV["CENTAUR_CONSOLE_SESSION_MAX_AGE"] = "0xFF"
+    assert_equal ConsoleSession::DEFAULT_MAX_AGE_SECONDS, ConsoleSession.expire_after
+  end
+
   test "falls back to the default for non-integer values" do
     ENV["CENTAUR_CONSOLE_SESSION_MAX_AGE"] = "not-a-number"
     assert_equal ConsoleSession::DEFAULT_MAX_AGE_SECONDS, ConsoleSession.expire_after

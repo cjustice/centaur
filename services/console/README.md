@@ -100,7 +100,7 @@ The operator console always supports email and password sign-in. To add Google o
 | `CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED` | no       | Set to `false` to disable email and password sign-in. Defaults to enabled.                    |
 | `CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED` | no | Set to `true` to let every authenticated Console user browse public Slack channel conversations. Requires the Slack ETL channel catalog; access fails closed when it is unavailable. Private channels and DMs remain owner-only. Defaults to disabled. |
 | `CENTAUR_CONSOLE_BOOTSTRAP_ADMINS`       | no       | Comma- or whitespace-separated email allowlist. Matching users become active admins on first SSO login. Other accepted SSO users become active non-admin operators and land on the console directly. |
-| `CENTAUR_CONSOLE_SESSION_MAX_AGE`        | no       | Absolute lifetime of the login session cookie, in seconds. Defaults to `1209600` (14 days). Set `0` or `session` for a browser-session cookie that expires when the browser closes. Invalid values fall back to the default. |
+| `CENTAUR_CONSOLE_SESSION_MAX_AGE`        | no       | Idle (sliding) lifetime of the login session cookie, in seconds: the cookie is refreshed on each authenticated request, so an operator is signed out only after this much inactivity. Defaults to `1209600` (14 days). Set `0` or `session` for a browser-session cookie that expires when the browser closes. Invalid values fall back to the default. Read at boot; changing it takes effect on process restart. |
 
 Register these callback URLs with the provider:
 
