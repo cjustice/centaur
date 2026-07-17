@@ -35,4 +35,25 @@ class McpOauthClientTest < ActiveSupport::TestCase
     refute client.redirect_uri_allowed?("http://127.evil.com/callback")
     refute client.redirect_uri_allowed?("http://127.0.0.1.evil.com/callback")
   end
+
+  test "scopes supports mcp tools and agent execution only" do
+    assert McpOauthClient.new(
+      name: "OMP",
+      redirect_uris: [ "http://127.0.0.1/callback" ],
+      grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
+      response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
+      scopes: [ "agents:execute" ]
+    ).valid?
+
+    client = McpOauthClient.new(
+      name: "Bad",
+      redirect_uris: [ "http://127.0.0.1/callback" ],
+      grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
+      response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
+      scopes: [ "mcp:tools", "agents:execute", "admin:*" ]
+    )
+
+    refute client.valid?
+    assert_includes client.errors[:scopes].join, "admin:*"
+  end
 end

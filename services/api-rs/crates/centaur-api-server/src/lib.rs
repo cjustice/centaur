@@ -319,9 +319,63 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(challenge.contains("Bearer"));
-        assert!(challenge.contains(
-            "resource_metadata=\"http://centaur.local/.well-known/oauth-protected-resource/mcp\""
-        ));
+        assert!(challenge.contains("/.well-known/oauth-protected-resource/mcp"));
+    }
+
+    #[tokio::test]
+    async fn agent_api_requires_bearer_before_runtime_is_ready() {
+        let app = build_router_with_app_state(AppState::unready());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents/executions")
+                    .header(header::HOST, "centaur.local")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"prompt":"hello","idempotency_key":"request-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(challenge.contains("Bearer"));
+        assert!(challenge.contains("scope=\"agents:execute\""));
+        assert!(challenge.contains("/.well-known/oauth-protected-resource/api/agents"));
+    }
+
+    #[tokio::test]
+    async fn agent_api_exposes_protected_resource_metadata_at_rfc_path() {
+        let app = build_router_with_app_state(AppState::unready());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/.well-known/oauth-protected-resource/api/agents")
+                    .header(header::HOST, "centaur.local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["resource"]
+                .as_str()
+                .is_some_and(|resource| resource.ends_with("/api/agents"))
+        );
+        assert_eq!(body["scopes_supported"], json!(["agents:execute"]));
     }
 
     #[tokio::test]

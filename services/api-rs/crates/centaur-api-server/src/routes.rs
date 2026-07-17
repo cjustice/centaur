@@ -55,7 +55,10 @@ use uuid::Uuid;
 use crate::{
     ApiError,
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
-    mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    mcp::{
+        agent_cancel_execution, agent_create_execution, agent_execution_events,
+        agent_protected_resource_metadata, mcp_get, mcp_post, mcp_protected_resource_metadata,
+    },
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
@@ -210,6 +213,20 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             get(mcp_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/api/agents",
+            get(agent_protected_resource_metadata),
+        )
+        .route("/api/agents", get(agent_protected_resource_metadata))
+        .route("/api/agents/executions", post(agent_create_execution))
+        .route(
+            "/api/agents/executions/{execution_id}/events",
+            get(agent_execution_events),
+        )
+        .route(
+            "/api/agents/executions/{execution_id}/cancel",
+            post(agent_cancel_execution),
         )
         .route(
             "/api/session/{thread_key}",

@@ -312,13 +312,22 @@ enum SessionPrincipalSource<'a> {
 }
 
 fn is_mcp_agent_thread(thread_key: &ThreadKey) -> bool {
-    thread_key.as_str().starts_with("mcp-agent:")
+    thread_key.as_str().starts_with("agent:")
 }
 
 fn reject_mcp_agent_raw_thread(thread_key: &ThreadKey) -> Result<(), SessionRuntimeError> {
     if is_mcp_agent_thread(thread_key) {
         return Err(SessionRuntimeError::BadRequest(
-            "mcp-agent threads require MCP-specific runtime APIs".to_owned(),
+            "agent threads require agent-specific runtime APIs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_external_agent_thread(thread_key: &ThreadKey) -> Result<(), SessionRuntimeError> {
+    if !is_mcp_agent_thread(thread_key) {
+        return Err(SessionRuntimeError::BadRequest(
+            "external agent APIs require an agent thread".to_owned(),
         ));
     }
     Ok(())
@@ -347,7 +356,7 @@ fn validate_session_principal_source(
         && is_mcp_agent_thread(thread_key)
     {
         return Err(SessionRuntimeError::BadRequest(
-            "mcp-agent threads require an existing external principal".to_owned(),
+            "agent threads require an existing external principal".to_owned(),
         ));
     }
     Ok(())
@@ -1408,6 +1417,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_id: &str,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -1980,6 +1990,7 @@ impl SessionRuntime {
         messages: &[SessionMessageInput],
         principal_id: &str,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -2318,12 +2329,35 @@ impl SessionRuntime {
             }))
     }
 
+    pub async fn external_execution(
+        &self,
+        execution_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let Some(execution) = self.store.execution(execution_id).await? else {
+            return Ok(None);
+        };
+        if !is_mcp_agent_thread(&execution.thread_key) {
+            return Ok(None);
+        }
+        let session = self.store.get_session(&execution.thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        Ok(Some(execution))
+    }
+
     pub async fn external_execution_status(
         &self,
         thread_key: &ThreadKey,
         execution_id: &str,
         principal_id: &str,
     ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -2346,6 +2380,7 @@ impl SessionRuntime {
         status: &ExecutionStatus,
         principal_id: &str,
     ) -> Result<bool, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -2507,6 +2542,7 @@ impl SessionRuntime {
         reason: &str,
         principal_id: &str,
     ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -2518,7 +2554,7 @@ impl SessionRuntime {
         let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
             return Ok(InterruptExecutionOutcome {
                 interrupted: false,
-                execution_id: None,
+                execution_id: Some(execution_id.to_owned()),
             });
         };
         if execution.execution_id != execution_id {
@@ -3460,6 +3496,7 @@ impl SessionRuntime {
         limit: i64,
         principal_id: &str,
     ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
         let principal_id = principal_id.trim();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
@@ -6964,7 +7001,7 @@ fn tool_host_thread_key(principal_id: &str) -> Result<ThreadKey, SessionRuntimeE
 fn tool_host_session_metadata(principal_id: &str) -> Value {
     json!({
         "mcp_tool_host": true,
-        "mcp_principal_id": principal_id,
+        "agent_principal_id": principal_id,
     })
 }
 
@@ -7103,7 +7140,7 @@ mod tests {
 
     #[test]
     fn derived_principals_cannot_claim_mcp_agent_threads() {
-        let mcp_thread = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let mcp_thread = ThreadKey::parse("agent:principal:request").unwrap();
         let ordinary_thread = ThreadKey::parse("slack:thread").unwrap();
 
         assert!(
@@ -7125,7 +7162,7 @@ mod tests {
 
     #[test]
     fn raw_runtime_entrypoints_reject_mcp_agent_threads() {
-        let mcp_thread = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let mcp_thread = ThreadKey::parse("agent:principal:request").unwrap();
 
         assert!(reject_mcp_agent_raw_thread(&mcp_thread).is_err());
     }
@@ -7134,7 +7171,7 @@ mod tests {
     fn external_principal_validation_rejects_cross_principal_session() {
         let now = OffsetDateTime::now_utc();
         let session = Session {
-            thread_key: ThreadKey::parse("mcp-agent:principal:request").unwrap(),
+            thread_key: ThreadKey::parse("agent:principal:request").unwrap(),
             title: None,
             sandbox_id: None,
             sandbox_capabilities: None,
@@ -8917,15 +8954,14 @@ mod adoption_tests {
             Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
         )
         .with_iron_control(registrar);
-        let thread_key =
-            ThreadKey::parse(format!("mcp-agent:test:{}", uuid::Uuid::new_v4())).unwrap();
+        let thread_key = ThreadKey::parse(format!("agent:test:{}", uuid::Uuid::new_v4())).unwrap();
 
         let outcome = runtime
             .create_or_get_external_session(
                 &thread_key,
                 &HarnessType::Codex,
                 None,
-                Some(json!({"mcp_agent": true})),
+                Some(json!({"agent_api": true})),
                 HarnessConflictPolicy::Reject,
                 "prn_mcp_caller",
             )
@@ -8950,7 +8986,7 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("mcp-agent:test:stream-{}", uuid::Uuid::new_v4())).unwrap();
+            ThreadKey::parse(format!("agent:test:stream-{}", uuid::Uuid::new_v4())).unwrap();
         let runtime = runtime_with(
             &store,
             Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
@@ -8971,7 +9007,7 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("mcp-agent:test:cancel-{}", uuid::Uuid::new_v4())).unwrap();
+            ThreadKey::parse(format!("agent:test:cancel-{}", uuid::Uuid::new_v4())).unwrap();
         store
             .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
             .await
@@ -9036,6 +9072,106 @@ mod adoption_tests {
             .await
             .expect("clean new execution");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_agent_api_rejects_non_agent_executions() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("console:test:{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("private"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        assert!(
+            runtime
+                .external_execution(&execution.execution_id, "principal-a")
+                .await
+                .expect("look up execution")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .list_external_events(
+                    &thread_key,
+                    0,
+                    Some(&execution.execution_id),
+                    100,
+                    "principal-a",
+                )
+                .await
+                .is_err()
+        );
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("clean execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_cancel_preserves_terminal_target_execution_id() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "agent:test:terminal-cancel-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let outcome = runtime
+            .interrupt_external_execution(
+                &thread_key,
+                &execution.execution_id,
+                "too late",
+                "principal-a",
+            )
+            .await
+            .expect("cancel terminal execution");
+        assert!(!outcome.interrupted);
+        assert_eq!(
+            outcome.execution_id.as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_execution_status_survives_cursor_past_terminal_event() {
         let Some(store) = test_store().await else {
@@ -9043,7 +9179,7 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("mcp-agent:test:status-{}", uuid::Uuid::new_v4())).unwrap();
+            ThreadKey::parse(format!("agent:test:status-{}", uuid::Uuid::new_v4())).unwrap();
         store
             .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
             .await

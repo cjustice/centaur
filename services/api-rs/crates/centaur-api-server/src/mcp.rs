@@ -9,7 +9,7 @@ use std::{
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -18,8 +18,7 @@ use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SessionMessageInput, ThreadKey,
 };
 use centaur_session_runtime::{
-    ExecuteSessionInput, HarnessConflictPolicy, SessionRuntime, SessionRuntimeError,
-    ToolHostCallInput,
+    ExecuteSessionInput, HarnessConflictPolicy, SessionRuntime, ToolHostCallInput,
 };
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
@@ -60,6 +59,18 @@ pub(crate) async fn mcp_protected_resource_metadata(headers: HeaderMap) -> Json<
     }))
 }
 
+pub(crate) async fn agent_protected_resource_metadata(headers: HeaderMap) -> Json<Value> {
+    let authorization_servers = mcp_authorization_server_url()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Json(json!({
+        "resource": agent_resource_url(&headers),
+        "authorization_servers": authorization_servers,
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["agents:execute"],
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct McpJsonRpcRequest {
     jsonrpc: Option<String>,
@@ -85,7 +96,7 @@ struct CentaurToolMcpArguments {
 }
 
 #[derive(Debug, Deserialize)]
-struct McpAgentStartArguments {
+pub(crate) struct AgentExecutionRequest {
     prompt: String,
     idempotency_key: String,
     #[serde(default)]
@@ -101,10 +112,7 @@ struct McpAgentStartArguments {
 }
 
 #[derive(Debug, Deserialize)]
-struct McpAgentEventsArguments {
-    thread_key: String,
-    #[serde(default)]
-    execution_id: Option<String>,
+pub(crate) struct AgentEventsQuery {
     #[serde(default)]
     after_event_id: Option<i64>,
     #[serde(default)]
@@ -112,9 +120,7 @@ struct McpAgentEventsArguments {
 }
 
 #[derive(Debug, Deserialize)]
-struct McpAgentCancelArguments {
-    thread_key: String,
-    execution_id: String,
+pub(crate) struct AgentCancelRequest {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -164,7 +170,6 @@ pub(crate) async fn mcp_post(
         "tools/list" => {
             ensure_mcp_scope(&principal.scopes, "mcp:tools")?;
             let mut tools = vec![mcp_whoami_tool()];
-            tools.extend(mcp_agent_tool_entries());
             tools.extend(mcp_centaur_tool_entries()?);
             json!({
                 "tools": tools,
@@ -176,21 +181,6 @@ pub(crate) async fn mcp_post(
                 .map_err(|error| ApiError::BadRequest(error.to_string()))?;
             if params.name == "centaur_whoami" {
                 mcp_whoami_result(&principal, params.arguments)?
-            } else if params.name == "centaur_agent_start" {
-                match mcp_agent_start_result(&state, &principal, params.arguments).await {
-                    Ok(result) => result,
-                    Err(error) => mcp_agent_domain_error_result(error)?,
-                }
-            } else if params.name == "centaur_agent_events" {
-                match mcp_agent_events_result(&state, &principal, params.arguments).await {
-                    Ok(result) => result,
-                    Err(error) => mcp_agent_domain_error_result(error)?,
-                }
-            } else if params.name == "centaur_agent_cancel" {
-                match mcp_agent_cancel_result(&state, &principal, params.arguments).await {
-                    Ok(result) => result,
-                    Err(error) => mcp_agent_domain_error_result(error)?,
-                }
             } else {
                 let Some(tool) = mcp_find_centaur_tool(&params.name)? else {
                     return Ok(mcp_json_error(id, -32602, "unknown tool"));
@@ -209,6 +199,47 @@ pub(crate) async fn mcp_post(
     .into_response())
 }
 
+pub(crate) async fn agent_create_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AgentExecutionRequest>,
+) -> Result<Response, ApiError> {
+    let Some(principal) = authenticate_agent_bearer(&headers)? else {
+        return Ok(agent_unauthorized(&headers));
+    };
+    ensure_scope(&principal.scopes, "agents:execute", "agents:*")?;
+    let body = agent_start_response(&state, &principal, request).await?;
+    Ok(Json(body).into_response())
+}
+
+pub(crate) async fn agent_execution_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(execution_id): Path<String>,
+    Query(query): Query<AgentEventsQuery>,
+) -> Result<Response, ApiError> {
+    let Some(principal) = authenticate_agent_bearer(&headers)? else {
+        return Ok(agent_unauthorized(&headers));
+    };
+    ensure_scope(&principal.scopes, "agents:execute", "agents:*")?;
+    let body = agent_events_response(&state, &principal, &execution_id, query).await?;
+    Ok(Json(body).into_response())
+}
+
+pub(crate) async fn agent_cancel_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(execution_id): Path<String>,
+    Json(request): Json<AgentCancelRequest>,
+) -> Result<Response, ApiError> {
+    let Some(principal) = authenticate_agent_bearer(&headers)? else {
+        return Ok(agent_unauthorized(&headers));
+    };
+    ensure_scope(&principal.scopes, "agents:execute", "agents:*")?;
+    let body = agent_cancel_response(&state, &principal, &execution_id, request).await?;
+    Ok(Json(body).into_response())
+}
+
 fn mcp_whoami_tool() -> Value {
     json!({
         "name": "centaur_whoami",
@@ -219,106 +250,6 @@ fn mcp_whoami_tool() -> Value {
             "additionalProperties": false,
         },
     })
-}
-
-fn mcp_agent_tool_entries() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "centaur_agent_start",
-            "description": "Start a durable Centaur sub-agent execution in a sandbox and return its thread_key and execution_id. Use centaur_agent_events to read progress.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["prompt", "idempotency_key"],
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Instruction to run in the sub-agent sandbox."
-                    },
-                    "idempotency_key": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES,
-                        "description": "Caller-generated key identifying this start request. Retrying the same key returns the same thread and execution without submitting the prompt again."
-                    },
-                    "harness": {
-                        "type": "string",
-                        "description": "Harness to run: codex, amp, or claudecode. New threads default to the deployment harness; existing threads keep their current harness."
-                    },
-                    "persona_id": {
-                        "type": "string",
-                        "description": "Optional Centaur persona id."
-                    },
-                    "thread_key": {
-                        "type": "string",
-                        "description": "Optional existing mcp-agent thread key returned by centaur_agent_start."
-                    },
-                    "idle_timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1
-                    },
-                    "max_duration_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MCP_AGENT_MAX_DURATION_MS,
-                        "description": "Maximum execution duration. Defaults to 30 minutes and cannot exceed 30 minutes."
-                    }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "centaur_agent_events",
-            "description": "Read durable events for a Centaur sub-agent execution.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["thread_key"],
-                "properties": {
-                    "thread_key": {
-                        "type": "string",
-                        "description": "mcp-agent thread key returned by centaur_agent_start."
-                    },
-                    "execution_id": {
-                        "type": "string",
-                        "description": "Optional execution id returned by centaur_agent_start."
-                    },
-                    "after_event_id": {
-                        "type": "integer",
-                        "description": "Only return events with event_id greater than this value."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 500,
-                        "description": "Maximum events to return. Defaults to 100."
-                    }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "centaur_agent_cancel",
-            "description": "Ask one exact active Centaur sub-agent execution for a thread to stop.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["thread_key", "execution_id"],
-                "properties": {
-                    "thread_key": {
-                        "type": "string",
-                        "description": "mcp-agent thread key returned by centaur_agent_start."
-                    },
-                    "execution_id": {
-                        "type": "string",
-                        "description": "Execution id returned by centaur_agent_start. Cancellation is ignored if this execution is no longer active."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Optional cancellation reason."
-                    }
-                },
-                "additionalProperties": false
-            }
-        }),
-    ]
 }
 
 fn mcp_centaur_tool_entries() -> Result<Vec<Value>, ApiError> {
@@ -508,13 +439,11 @@ fn mcp_whoami_result(principal: &McpPrincipal, arguments: Value) -> Result<Value
     ))
 }
 
-async fn mcp_agent_start_result(
+async fn agent_start_response(
     state: &AppState,
     principal: &McpPrincipal,
-    arguments: Value,
+    params: AgentExecutionRequest,
 ) -> Result<Value, ApiError> {
-    let params = serde_json::from_value::<McpAgentStartArguments>(arguments)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let prompt = params.prompt.trim().to_owned();
     if prompt.is_empty() {
         return Err(ApiError::BadRequest("prompt is required".to_owned()));
@@ -584,7 +513,7 @@ async fn mcp_agent_start_result(
             &principal.principal_id,
         )
         .await?;
-    mcp_json_result(json!({
+    Ok(json!({
         "thread_key": thread_key,
         "execution_id": execution.execution_id,
         "status": execution.status,
@@ -593,26 +522,38 @@ async fn mcp_agent_start_result(
     }))
 }
 
-async fn mcp_agent_events_result(
+async fn agent_events_response(
     state: &AppState,
     principal: &McpPrincipal,
-    arguments: Value,
+    execution_id: &str,
+    query: AgentEventsQuery,
 ) -> Result<Value, ApiError> {
-    let params = serde_json::from_value::<McpAgentEventsArguments>(arguments)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let thread_key = mcp_validate_agent_thread_key(principal, &params.thread_key)?;
-    let limit = params.limit.unwrap_or(100);
+    let execution_id = execution_id.trim();
+    if execution_id.is_empty() {
+        return Err(ApiError::BadRequest("execution_id is required".to_owned()));
+    }
+    if query.after_event_id.is_some_and(|event_id| event_id < 0) {
+        return Err(ApiError::BadRequest(
+            "after_event_id must be greater than or equal to zero".to_owned(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(100);
     if !(1..=500).contains(&limit) {
         return Err(ApiError::BadRequest(
             "limit must be between 1 and 500".to_owned(),
         ));
     }
     let runtime = state.runtime()?;
+    let execution = runtime
+        .external_execution(execution_id, &principal.principal_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("execution not found".to_owned()))?;
+    let thread_key = execution.thread_key.clone();
     let mut events = runtime
         .list_external_events(
             &thread_key,
-            params.after_event_id.unwrap_or(0),
-            params.execution_id.as_deref(),
+            query.after_event_id.unwrap_or(0),
+            Some(execution_id),
             limit + 1,
             &principal.principal_id,
         )
@@ -620,65 +561,64 @@ async fn mcp_agent_events_result(
     let has_more = events.len() > limit as usize;
     events.truncate(limit as usize);
     let last_event_id = events.last().map(|event| event.event_id);
-    let execution_status = match params.execution_id.as_deref() {
-        Some(execution_id) => {
-            runtime
-                .external_execution_status(&thread_key, execution_id, &principal.principal_id)
-                .await?
-        }
-        None => None,
-    };
-    let terminal_status = mcp_terminal_status_from_execution_status(execution_status.as_ref());
-    let terminal_event_observed = match (params.execution_id.as_deref(), execution_status.as_ref())
-    {
-        (Some(execution_id), Some(status)) => {
-            mcp_terminal_event_visible_in_events(&events, execution_id, status)
+    let terminal_status = mcp_terminal_status_from_execution_status(Some(&execution.status));
+    let terminal_event_observed = match terminal_status {
+        Some(_) => {
+            mcp_terminal_event_visible_in_events(&events, execution_id, &execution.status)
                 || runtime
                     .external_terminal_event_observed(
                         &thread_key,
                         execution_id,
-                        status,
+                        &execution.status,
                         &principal.principal_id,
                     )
                     .await?
         }
-        _ => false,
+        None => false,
     };
-    mcp_json_result(json!({
+    Ok(json!({
         "thread_key": thread_key,
-        "execution_id": params.execution_id,
+        "execution_id": execution_id,
         "events": events,
         "last_event_id": last_event_id,
+        "status": execution.status,
         "terminal_status": terminal_status,
         "terminal_event_observed": terminal_event_observed,
         "has_more": has_more,
     }))
 }
 
-async fn mcp_agent_cancel_result(
+async fn agent_cancel_response(
     state: &AppState,
     principal: &McpPrincipal,
-    arguments: Value,
+    execution_id: &str,
+    params: AgentCancelRequest,
 ) -> Result<Value, ApiError> {
-    let params = serde_json::from_value::<McpAgentCancelArguments>(arguments)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let thread_key = mcp_validate_agent_thread_key(principal, &params.thread_key)?;
+    let execution_id = execution_id.trim();
+    if execution_id.is_empty() {
+        return Err(ApiError::BadRequest("execution_id is required".to_owned()));
+    }
+    let runtime = state.runtime()?;
+    let execution = runtime
+        .external_execution(execution_id, &principal.principal_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("execution not found".to_owned()))?;
     let reason = params
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("Interrupted from MCP");
-    let execution_id = params.execution_id.trim();
-    if execution_id.is_empty() {
-        return Err(ApiError::BadRequest("execution_id is required".to_owned()));
-    }
-    let outcome = state
-        .runtime()?
-        .interrupt_external_execution(&thread_key, execution_id, reason, &principal.principal_id)
+        .unwrap_or("Interrupted from agent API");
+    let outcome = runtime
+        .interrupt_external_execution(
+            &execution.thread_key,
+            execution_id,
+            reason,
+            &principal.principal_id,
+        )
         .await?;
-    mcp_json_result(json!({
-        "thread_key": thread_key,
+    Ok(json!({
+        "thread_key": execution.thread_key,
         "interrupted": outcome.interrupted,
         "execution_id": outcome.execution_id,
     }))
@@ -730,7 +670,7 @@ fn mcp_validate_agent_thread_key(
     let prefix = mcp_agent_thread_prefix(principal);
     if !thread_key.as_str().starts_with(&prefix) {
         return Err(ApiError::Forbidden(
-            "mcp agent thread_key does not belong to this principal".to_owned(),
+            "agent thread_key does not belong to this principal".to_owned(),
         ));
     }
     Ok(thread_key)
@@ -738,21 +678,21 @@ fn mcp_validate_agent_thread_key(
 
 fn mcp_agent_thread_prefix(principal: &McpPrincipal) -> String {
     let digest = Sha256::digest(principal.principal_id.as_bytes());
-    format!("mcp-agent:{}:", hex::encode(&digest[..12]))
+    format!("agent:{}:", hex::encode(&digest[..12]))
 }
 
 fn mcp_agent_session_metadata(principal: &McpPrincipal) -> Value {
     json!({
-        "mcp_agent": true,
-        "mcp_principal_id": principal.principal_id,
+        "agent_api": true,
+        "agent_principal_id": principal.principal_id,
     })
 }
 
 fn mcp_agent_execution_metadata(principal: &McpPrincipal, request_fingerprint: &str) -> Value {
     json!({
-        "mcp_agent": true,
-        "mcp_principal_id": principal.principal_id,
-        "mcp_request_fingerprint": request_fingerprint,
+        "agent_api": true,
+        "agent_principal_id": principal.principal_id,
+        "agent_request_fingerprint": request_fingerprint,
     })
 }
 
@@ -965,38 +905,18 @@ fn mcp_text_result(text: String, is_error: bool) -> Value {
     })
 }
 
-fn mcp_json_result(value: Value) -> Result<Value, ApiError> {
-    Ok(mcp_text_result(
-        serde_json::to_string_pretty(&value)?,
-        false,
-    ))
-}
-
-fn mcp_agent_domain_error_result(error: ApiError) -> Result<Value, ApiError> {
-    let is_domain_error = matches!(
-        &error,
-        ApiError::BadRequest(_) | ApiError::Forbidden(_) | ApiError::NotFound(_)
-    ) || matches!(
-        &error,
-        ApiError::Runtime(SessionRuntimeError::BadRequest(_))
-            | ApiError::Runtime(SessionRuntimeError::CapacityExceeded { .. })
-            | ApiError::Runtime(SessionRuntimeError::Store(
-                centaur_session_sqlx::SessionStoreError::NotFound { .. }
-                    | centaur_session_sqlx::SessionStoreError::HarnessConflict { .. }
-                    | centaur_session_sqlx::SessionStoreError::PersonaConflict { .. }
-            ))
-    );
-    if is_domain_error {
-        return Ok(mcp_text_result(error.to_string(), true));
-    }
-    Err(error)
-}
-
 fn authenticate_mcp_bearer(headers: &HeaderMap) -> Result<Option<McpPrincipal>, ApiError> {
     let Some(token) = bearer_token(headers) else {
         return Ok(None);
     };
-    verify_mcp_jwt(&token, headers)
+    verify_resource_jwt(&token, headers, mcp_resource_url(headers))
+}
+
+fn authenticate_agent_bearer(headers: &HeaderMap) -> Result<Option<McpPrincipal>, ApiError> {
+    let Some(token) = bearer_token(headers) else {
+        return Ok(None);
+    };
+    verify_resource_jwt(&token, headers, agent_resource_url(headers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1028,7 +948,11 @@ struct McpJwtClaims {
     sub: Option<String>,
 }
 
-fn verify_mcp_jwt(token: &str, headers: &HeaderMap) -> Result<Option<McpPrincipal>, ApiError> {
+fn verify_resource_jwt(
+    token: &str,
+    _headers: &HeaderMap,
+    resource_url: String,
+) -> Result<Option<McpPrincipal>, ApiError> {
     let secret = jwt_signing_secret()
         .filter(|secret| !secret.trim().is_empty())
         .ok_or_else(|| {
@@ -1078,7 +1002,7 @@ fn verify_mcp_jwt(token: &str, headers: &HeaderMap) -> Result<Option<McpPrincipa
     if !same_url(&claims.iss, &issuer) {
         return Ok(None);
     }
-    if !audience_contains(&claims.aud, &mcp_resource_url(headers)) {
+    if !audience_contains(&claims.aud, &resource_url) {
         return Ok(None);
     }
     if claims.principal_id.trim().is_empty() {
@@ -1173,9 +1097,13 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn ensure_mcp_scope(scopes: &[String], required: &str) -> Result<(), ApiError> {
+    ensure_scope(scopes, required, "mcp:*")
+}
+
+fn ensure_scope(scopes: &[String], required: &str, wildcard: &str) -> Result<(), ApiError> {
     if scopes
         .iter()
-        .any(|scope| scope == "*" || scope == required || scope == "mcp:*")
+        .any(|scope| scope == "*" || scope == required || scope == wildcard)
     {
         Ok(())
     } else {
@@ -1231,6 +1159,26 @@ fn mcp_unauthorized(headers: &HeaderMap) -> Response {
     response
 }
 
+fn agent_unauthorized(headers: &HeaderMap) -> Response {
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource/api/agents",
+        agent_public_base_url(headers)
+    );
+    let challenge = format!(r#"Bearer resource_metadata="{metadata}", scope="agents:execute""#);
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "error": "missing or invalid agent bearer token",
+        })),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert("WWW-Authenticate", value);
+    }
+    response
+}
+
 fn mcp_resource_url(headers: &HeaderMap) -> String {
     if let Some(url) = mcp_public_url_env()
         .as_deref()
@@ -1239,6 +1187,23 @@ fn mcp_resource_url(headers: &HeaderMap) -> String {
         return url;
     }
     format!("{}/mcp", request_base_url(headers))
+}
+
+fn agent_resource_url(headers: &HeaderMap) -> String {
+    if let Some(url) = console_public_url_env()
+        .as_deref()
+        .and_then(normalize_public_url)
+    {
+        return format!("{}/api/agents", url);
+    }
+    format!("{}/api/agents", request_base_url(headers))
+}
+
+fn agent_public_base_url(headers: &HeaderMap) -> String {
+    agent_resource_url(headers)
+        .strip_suffix("/api/agents")
+        .map(str::to_owned)
+        .unwrap_or_else(|| request_base_url(headers))
 }
 
 fn mcp_authorization_server_url() -> Option<String> {
@@ -1412,37 +1377,22 @@ mod mcp_tests {
     }
 
     #[test]
-    fn mcp_agent_tools_are_listed_as_builtin_tools() {
-        let tools = mcp_agent_tool_entries();
+    fn mcp_tools_list_does_not_advertise_agent_execution_tools() {
+        let mut tools = vec![mcp_whoami_tool()];
+        tools.extend(mcp_centaur_tool_entries().unwrap());
         let names = tools
             .iter()
-            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "centaur_agent_start",
-                "centaur_agent_events",
-                "centaur_agent_cancel"
-            ]
-        );
-        assert_eq!(
-            tools[0]["inputSchema"]["properties"]["max_duration_ms"]["maximum"],
-            MCP_AGENT_MAX_DURATION_MS
-        );
-        assert_eq!(
-            tools[0]["inputSchema"]["required"],
-            json!(["prompt", "idempotency_key"])
-        );
-        assert_eq!(
-            tools[2]["inputSchema"]["required"],
-            json!(["thread_key", "execution_id"])
-        );
+        assert!(names.contains(&"centaur_whoami"));
+        assert!(!names.contains(&"centaur_agent_start"));
+        assert!(!names.contains(&"centaur_agent_events"));
+        assert!(!names.contains(&"centaur_agent_cancel"));
     }
 
     #[test]
     fn mcp_agent_input_uses_harness_user_message_shape() {
-        let thread_key = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let thread_key = ThreadKey::parse("agent:principal:request").unwrap();
         let line = mcp_agent_input_line(
             &thread_key,
             "inspect the failure",
@@ -1507,14 +1457,14 @@ mod mcp_tests {
         let refreshed_metadata = mcp_agent_execution_metadata(&refreshed, "fingerprint-1");
 
         assert_eq!(first_metadata, refreshed_metadata);
-        assert_eq!(first_metadata["mcp_principal_id"], "principal-ada");
-        assert_eq!(first_metadata["mcp_request_fingerprint"], "fingerprint-1");
+        assert_eq!(first_metadata["agent_principal_id"], "principal-ada");
+        assert_eq!(first_metadata["agent_request_fingerprint"], "fingerprint-1");
         assert!(first_metadata.get("mcp_token_id").is_none());
     }
 
     #[test]
     fn mcp_terminal_status_uses_execution_status_and_tracks_visible_event() {
-        let thread_key = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let thread_key = ThreadKey::parse("agent:principal:request").unwrap();
         let completed = centaur_session_core::SessionEvent {
             event_id: 10,
             thread_key: thread_key.clone(),
@@ -1737,6 +1687,70 @@ def search(query, limit=20):
         assert_eq!(principal.name, "test@example.com");
         assert_eq!(principal.scopes, vec!["mcp:tools"]);
         assert!(principal.expires_at.is_some());
+    }
+
+    #[test]
+    fn agent_jwt_uses_console_api_agents_audience_and_scope() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            (
+                "CENTAUR_CONSOLE_PUBLIC_URL",
+                "http://betterbuilder.bettermoney.com",
+            ),
+        ]);
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://betterbuilder.bettermoney.com",
+                "sub": "usr_test",
+                "aud": "http://betterbuilder.bettermoney.com/api/agents",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "iat": OffsetDateTime::now_utc().unix_timestamp(),
+                "jti": "agentjwt_test",
+                "scope": "agents:execute",
+                "principal_id": "prn_test",
+                "email": "test@example.com",
+            }),
+        );
+
+        let principal = authenticate_agent_bearer(&mcp_auth_headers(&token))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(principal.token_id, "agentjwt_test");
+        assert_eq!(principal.principal_id, "prn_test");
+        assert_eq!(principal.scopes, vec!["agents:execute"]);
+    }
+
+    #[test]
+    fn agent_jwt_rejects_mcp_audience_even_with_agent_scope() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            (
+                "CENTAUR_CONSOLE_PUBLIC_URL",
+                "http://betterbuilder.bettermoney.com",
+            ),
+        ]);
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://betterbuilder.bettermoney.com",
+                "aud": "http://localhost:3000/mcp",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "principal_id": "prn_test",
+                "scope": "agents:execute",
+            }),
+        );
+
+        assert!(
+            authenticate_agent_bearer(&mcp_auth_headers(&token))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

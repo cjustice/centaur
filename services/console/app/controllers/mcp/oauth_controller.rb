@@ -27,7 +27,7 @@ module Mcp
         grant_types_supported: McpOauthClient::DEFAULT_GRANT_TYPES,
         code_challenge_methods_supported: [ "S256" ],
         token_endpoint_auth_methods_supported: [ "none" ],
-        scopes_supported: McpOauthClient::DEFAULT_SCOPES,
+        scopes_supported: McpOauthClient::SUPPORTED_SCOPES,
         resource_parameter_supported: true
       }
     end
@@ -143,7 +143,7 @@ module Mcp
       end
 
       scopes = normalize_scope_param(params[:scope], McpOauthClient::DEFAULT_SCOPES)
-      unsupported = scopes - McpOauthClient::DEFAULT_SCOPES
+      unsupported = scopes - McpOauthClient::SUPPORTED_SCOPES
       if unsupported.any?
         return authorization_request_error(
           client,
@@ -151,8 +151,16 @@ module Mcp
           "Unsupported scope: #{unsupported.join(' ')}."
         )
       end
+      unauthorized = scopes - client.scopes
+      if unauthorized.any?
+        return authorization_request_error(
+          client,
+          :invalid_scope,
+          "Client is not registered for scope: #{unauthorized.join(' ')}."
+        )
+      end
 
-      resource = resolve_requested_resource
+      resource = resolve_requested_resource(scopes)
       return authorization_request_error(client, :invalid_target, "resource is required.") if resource.blank?
 
       { client: client, scopes: scopes, resource: resource }
@@ -412,18 +420,41 @@ module Mcp
       McpOauthClient.find_by_oid(client_id)
     end
 
-    def resolve_requested_resource
-      # Fail closed: without a configured canonical resource URL we would
-      # otherwise mint tokens bound to any caller-supplied audience.
-      configured = normalize_mcp_resource_url(configured_mcp_resource_url)
-      return nil if configured.blank?
+    def resolve_requested_resource(scopes)
+      resources = supported_resource_scope_pairs
       requested = params[:resource].presence
-      return nil if requested.present? && normalize_mcp_resource_url(requested) != configured
-      configured
+      normalized = if requested.present?
+        normalize_resource_url(requested)
+      elsif scopes == McpOauthClient::DEFAULT_SCOPES
+        configured_mcp_resource_url
+      end
+      return nil if normalized.blank?
+
+      allowed_scopes = resources[normalized]
+      return nil unless allowed_scopes.present? && scopes.sort == allowed_scopes.sort
+
+      normalized
+    end
+
+    def supported_resource_scope_pairs
+      {}.tap do |resources|
+        resources[configured_mcp_resource_url] = McpOauthClient::MCP_SCOPES if configured_mcp_resource_url.present?
+        resources[configured_agent_resource_url] = McpOauthClient::AGENT_SCOPES
+      end
     end
 
     def configured_mcp_resource_url
-      ENV["CENTAUR_MCP_PUBLIC_URL"].presence || ConsoleEnv["MCP_PUBLIC_URL"].presence
+      normalize_mcp_resource_url(
+        ENV["CENTAUR_MCP_PUBLIC_URL"].presence || ConsoleEnv["MCP_PUBLIC_URL"].presence
+      )
+    end
+
+    def configured_agent_resource_url
+      URI.join(public_base_url, "/api/agents").to_s
+    end
+
+    def normalize_resource_url(value)
+      normalize_agent_resource_url(value) || normalize_mcp_resource_url(value)
     end
 
     def normalize_mcp_resource_url(value)
@@ -432,6 +463,18 @@ module Mcp
       uri.fragment = nil
       path = uri.path.to_s.sub(%r{/+\z}, "")
       uri.path = path.end_with?("/mcp") ? path : "#{path}/mcp"
+      uri.to_s.sub(/\?\z/, "")
+    rescue URI::InvalidURIError
+      nil
+    end
+
+    def normalize_agent_resource_url(value)
+      uri = URI.parse(value.to_s.strip)
+      return nil unless %w[http https].include?(uri.scheme) && uri.host.present?
+      uri.fragment = nil
+      path = uri.path.to_s.sub(%r{/+\z}, "")
+      return nil unless path.end_with?("/api/agents")
+      uri.path = path
       uri.to_s.sub(/\?\z/, "")
     rescue URI::InvalidURIError
       nil

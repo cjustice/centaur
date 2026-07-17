@@ -451,6 +451,24 @@ impl PgSessionStore {
         row.map(TryInto::try_into).transpose()
     }
 
+    pub async fn execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where execution_id = $1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn mark_execution_running(
         &self,
         execution_id: &str,

@@ -37,6 +37,8 @@ module Mcp
       assert_equal "http://www.example.com/mcp/oauth/token", body.fetch("token_endpoint")
       assert_equal "http://www.example.com/mcp/oauth/register", body.fetch("registration_endpoint")
       assert_includes body.fetch("code_challenge_methods_supported"), "S256"
+      assert_includes body.fetch("scopes_supported"), "mcp:tools"
+      assert_includes body.fetch("scopes_supported"), "agents:execute"
     end
 
     test "dynamic client registration creates a public PKCE client" do
@@ -55,6 +57,22 @@ module Mcp
       assert_match(/\Amoc_/, body.fetch("client_id"))
       assert_equal "none", body.fetch("token_endpoint_auth_method")
       assert_equal "mcp:tools", body.fetch("scope")
+    end
+
+    test "dynamic client registration creates an agent API client" do
+      assert_difference -> { McpOauthClient.count }, 1 do
+        post "/mcp/oauth/register",
+             params: {
+               client_name: "OMP",
+               redirect_uris: [ "http://127.0.0.1:49152/callback" ],
+               scope: "agents:execute"
+             },
+             as: :json
+      end
+
+      assert_response :created
+      body = JSON.parse(response.body)
+      assert_equal "agents:execute", body.fetch("scope")
     end
 
     test "dynamic client registration creates a hosted HTTPS client" do
@@ -173,6 +191,49 @@ module Mcp
       assert_equal "mcp:tools", jwt_payload.fetch("scope")
     end
 
+    test "authorization code exchange returns a JWT access token for the agent API resource" do
+      client = create_client(scopes: McpOauthClient::AGENT_SCOPES)
+      code = authorize_code(
+        client,
+        scope: "agents:execute",
+        resource: "http://www.example.com/api/agents"
+      )
+      stored_code = McpOauthAuthorizationCode.find_usable(code)
+      assert_equal "http://www.example.com/api/agents", stored_code.resource
+
+      exchange_authorization_code(client, code)
+
+      assert_response :ok
+      body = JSON.parse(response.body)
+      assert_equal "agents:execute", body.fetch("scope")
+
+      jwt_payload = decode_jwt_payload(body.fetch("access_token"))
+      assert_equal "http://www.example.com/api/agents", jwt_payload.fetch("aud")
+      assert_equal "agents:execute", jwt_payload.fetch("scope")
+    end
+
+    test "authorization rejects cross-paired resource and scope" do
+      client = create_client(scopes: McpOauthClient::AGENT_SCOPES)
+      post login_url, params: { email: @operator.email, password: "password123456" }
+
+      assert_no_difference -> { McpOauthAuthorizationCode.count } do
+        get "/mcp/oauth/authorize",
+            params: authorize_params(
+              client,
+              scope: "agents:execute",
+              resource: "http://localhost:3000/mcp"
+            )
+      end
+
+      assert_response :found
+      redirect = URI.parse(response.location)
+      query = Rack::Utils.parse_query(redirect.query)
+      callback_url = "#{redirect.scheme}://#{redirect.host}:#{redirect.port}#{redirect.path}"
+      assert_equal "http://127.0.0.1:49152/callback", callback_url
+      assert_equal "invalid_target", query.fetch("error")
+      assert_equal "resource is required.", query.fetch("error_description")
+    end
+
     test "authorization approval seeds new console principals with the user-mcp role" do
       client = create_client
 
@@ -289,31 +350,31 @@ module Mcp
 
     private
 
-    def create_client(redirect_uris: [ redirect_uri ])
+    def create_client(redirect_uris: [ redirect_uri ], scopes: McpOauthClient::DEFAULT_SCOPES)
       McpOauthClient.create!(
         name: "Amp",
         redirect_uris: redirect_uris,
         grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
         response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
-        scopes: McpOauthClient::DEFAULT_SCOPES
+        scopes: scopes
       )
     end
 
-    def authorize_params(client)
+    def authorize_params(client, scope: "mcp:tools", resource: "http://localhost:3000/mcp")
       {
         response_type: "code",
         client_id: client.public_client_id,
         redirect_uri: redirect_uri,
-        scope: "mcp:tools",
+        scope: scope,
         state: "state-test",
-        resource: "http://localhost:3000/mcp",
+        resource: resource,
         code_challenge: code_challenge,
         code_challenge_method: "S256"
       }
     end
 
-    def authorize_code(client)
-      approval_params = authorize_params(client)
+    def authorize_code(client, scope: "mcp:tools", resource: "http://localhost:3000/mcp")
+      approval_params = authorize_params(client, scope: scope, resource: resource)
       post login_url, params: { email: @operator.email, password: "password123456" }
 
       assert_no_difference -> { McpOauthAuthorizationCode.count } do
