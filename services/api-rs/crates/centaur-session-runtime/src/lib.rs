@@ -24,11 +24,11 @@ use centaur_session_core::{
     ChatDestination, ExecutionStatus, HarnessType, MessageRole,
     SandboxCapabilities as SessionSandboxCapabilities,
     SandboxRepoCacheAccess as SessionRepoCacheAccess, Session, SessionEvent, SessionExecution,
-    SessionMessageInput, ThreadKey,
+    SessionMessageInput, SessionStatus, ThreadKey,
 };
 use centaur_session_sqlx::{
     PgSessionStore, SandboxCapacityCandidate, SessionEventListener, SessionStoreError,
-    default_metadata,
+    TerminalExecutionEventInput, TerminalExecutionExtraEvent, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -68,6 +68,12 @@ const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_LIFECYCLE_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT: Duration = Duration::from_millis(100);
+const INPUT_DELIVERY_CLAIM_LEASE: Duration = Duration::from_secs(300);
 /// A live execution can briefly have no sandbox while it moves from queued
 /// through warm-sandbox assignment. A periodic adoption scan must not fail a
 /// young row it observes in that window.
@@ -303,6 +309,63 @@ pub enum HarnessConflictPolicy {
     /// clear the harness thread state, and switch the session row over. The
     /// new harness starts with no conversational memory.
     Restart,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionPrincipalSource<'a> {
+    Derived,
+    Existing(&'a str),
+}
+
+fn is_mcp_agent_thread(thread_key: &ThreadKey) -> bool {
+    thread_key.as_str().starts_with("agent:")
+}
+
+fn reject_mcp_agent_raw_thread(thread_key: &ThreadKey) -> Result<(), SessionRuntimeError> {
+    if is_mcp_agent_thread(thread_key) {
+        return Err(SessionRuntimeError::BadRequest(
+            "agent threads require agent-specific runtime APIs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_external_agent_thread(thread_key: &ThreadKey) -> Result<(), SessionRuntimeError> {
+    if !is_mcp_agent_thread(thread_key) {
+        return Err(SessionRuntimeError::BadRequest(
+            "external agent APIs require an agent thread".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_principal(
+    session: &Session,
+    principal_id: &str,
+) -> Result<(), SessionRuntimeError> {
+    match session.iron_control_principal.as_deref() {
+        Some(persisted) if persisted == principal_id => Ok(()),
+        Some(_) => Err(SessionRuntimeError::BadRequest(
+            "session principal does not match authenticated caller".to_owned(),
+        )),
+        None => Err(SessionRuntimeError::BadRequest(
+            "session is missing persisted principal".to_owned(),
+        )),
+    }
+}
+
+fn validate_session_principal_source(
+    thread_key: &ThreadKey,
+    principal_source: SessionPrincipalSource<'_>,
+) -> Result<(), SessionRuntimeError> {
+    if matches!(principal_source, SessionPrincipalSource::Derived)
+        && is_mcp_agent_thread(thread_key)
+    {
+        return Err(SessionRuntimeError::BadRequest(
+            "agent threads require an existing external principal".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Result of [`SessionRuntime::create_or_get_session`].
@@ -842,11 +905,22 @@ impl SessionRuntime {
             .unwrap_or_default()
     }
 
+    pub fn default_harness(&self) -> HarnessType {
+        self.sandbox_runtime
+            .warm_harness
+            .clone()
+            .unwrap_or(HarnessType::Codex)
+    }
+
     pub async fn session_title(
         &self,
         thread_key: &ThreadKey,
     ) -> Result<Option<String>, SessionRuntimeError> {
         Ok(self.store.get_session_title(thread_key).await?)
+    }
+
+    pub async fn session(&self, thread_key: &ThreadKey) -> Result<Session, SessionRuntimeError> {
+        Ok(self.store.get_session(thread_key).await?)
     }
 
     fn resolve_persona_for_create(
@@ -1328,6 +1402,55 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            SessionPrincipalSource::Derived,
+        )
+        .await
+    }
+
+    pub async fn create_or_get_external_session(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_id: &str,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            SessionPrincipalSource::Existing(principal_id),
+        )
+        .await
+    }
+
+    async fn create_or_get_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_source: SessionPrincipalSource<'_>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        validate_session_principal_source(thread_key, principal_source)?;
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1355,11 +1478,18 @@ impl SessionRuntime {
             );
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
-            let (registered_principal, desired_capabilities) =
+            let (resolved_principal, desired_capabilities) =
                 if let Some(registrar) = &self.iron_control {
-                    let principal = registrar
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
-                        .await?;
+                    let principal = match principal_source {
+                        SessionPrincipalSource::Derived => {
+                            registrar
+                                .register_session(thread_key.as_str(), Some(&session_metadata))
+                                .await?
+                        }
+                        SessionPrincipalSource::Existing(principal_id) => {
+                            registrar.get_principal(principal_id).await?
+                        }
+                    };
                     let desired_capabilities = sandbox_capabilities_from_principal(&principal);
                     (Some(principal), desired_capabilities)
                 } else {
@@ -1422,12 +1552,47 @@ impl SessionRuntime {
                     )
                     .await?;
             }
-            if let Some(principal) = registered_principal {
+            if let Some(principal) = resolved_principal {
+                if let SessionPrincipalSource::Existing(principal_id) = principal_source
+                    && let Some(persisted) = session.iron_control_principal.as_deref()
+                    && persisted != principal_id
+                {
+                    return Err(SessionRuntimeError::BadRequest(
+                        "session principal does not match authenticated caller".to_owned(),
+                    ));
+                }
                 // Persist the principal OID on the session row so a resumed session
                 // can recreate its sandbox after a restart without re-deriving it.
                 let session = self
                     .store
                     .set_iron_control_principal(thread_key, Some(&principal.id))
+                    .await?;
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_create_or_get_completed",
+                    thread_key = %thread_key,
+                    harness_type = %harness_type,
+                    status = %session.status,
+                    iron_control_principal_persisted = true,
+                    harness_switched,
+                    "session ready"
+                );
+                return Ok(CreateOrGetSessionOutcome {
+                    session,
+                    harness_switched,
+                });
+            }
+            if let SessionPrincipalSource::Existing(principal_id) = principal_source {
+                if let Some(persisted) = session.iron_control_principal.as_deref()
+                    && persisted != principal_id
+                {
+                    return Err(SessionRuntimeError::BadRequest(
+                        "session principal does not match authenticated caller".to_owned(),
+                    ));
+                }
+                let session = self
+                    .store
+                    .set_iron_control_principal(thread_key, Some(principal_id))
                     .await?;
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
@@ -1534,6 +1699,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1799,6 +1965,61 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.execute_session_with_initial_messages(thread_key, input, None)
+            .await
+    }
+
+    /// Starts an execution and uses the durable execution idempotency claim to
+    /// gate its initial messages. Retries never steer duplicate input, and a
+    /// retry can safely recover a queued execution left before message append.
+    pub async fn execute_session_with_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        messages: &[SessionMessageInput],
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        if messages.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "messages must not be empty".to_owned(),
+            ));
+        }
+        self.execute_session_with_initial_messages(thread_key, input, Some(messages))
+            .await
+    }
+
+    pub async fn execute_external_session_with_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        messages: &[SessionMessageInput],
+        principal_id: &str,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        if messages.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "messages must not be empty".to_owned(),
+            ));
+        }
+        self.execute_session_with_initial_messages(thread_key, input, Some(messages))
+            .await
+    }
+
+    async fn execute_session_with_initial_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        initial_messages: Option<&[SessionMessageInput]>,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
         let ExecuteSessionInput {
             idempotency_key,
             metadata,
@@ -1841,12 +2062,18 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
 
+            let lifecycle_fence = self
+                .store
+                .acquire_session_lifecycle_fence(thread_key, SESSION_LIFECYCLE_FENCE_TIMEOUT)
+                .await?;
+            let requested_execution_metadata =
+                execution_metadata(metadata, idle_timeout_ms, max_duration_ms);
             let execution = self
                 .store
                 .create_execution(
                     thread_key,
                     idempotency_key.as_deref(),
-                    execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
+                    requested_execution_metadata.clone(),
                 )
                 .await?;
             span.record(
@@ -1854,36 +2081,119 @@ impl SessionRuntime {
                 execution.execution.execution_id.as_str(),
             );
             span.record("execution_id", execution.execution.execution_id.as_str());
-            if !execution.created && execution.execution.status != ExecutionStatus::Queued {
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_execute_idempotent_replay",
-                    thread_key = %thread_key,
-                    execution_id = %execution.execution.execution_id,
-                    status = %execution.execution.status,
-                    "returning existing execution"
-                );
-                return Ok(execution.execution);
+            if initial_messages.is_some()
+                && !execution.created
+                && !execution_metadata_matches_requested(
+                    &execution.execution.metadata,
+                    &requested_execution_metadata,
+                )
+            {
+                return Err(SessionRuntimeError::BadRequest(
+                    "idempotency_key was already used with different agent inputs".to_owned(),
+                ));
             }
-            let claim = self
-                .store
-                .mark_execution_running(&execution.execution.execution_id)
-                .await?;
-            let execution = claim.execution;
+            if let Some(messages) = initial_messages {
+                if !execution.created
+                    && execution.execution.status != ExecutionStatus::Queued
+                    && execution_input_delivered(&execution.execution)
+                {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_execute_idempotent_replay",
+                        thread_key = %thread_key,
+                        execution_id = %execution.execution.execution_id,
+                        status = %execution.execution.status,
+                        "returning existing execution without appending duplicate messages"
+                    );
+                    return Ok(execution.execution);
+                }
+                // A retry may observe a queued execution if the request that
+                // inserted it crashed before persisting the prompt. Message
+                // client ids make this direct store append idempotent; the
+                // lifecycle fence keeps startup ordered with cancellation and
+                // idle teardown.
+                if let Err(error) = self.store.append_messages(thread_key, messages).await {
+                    let error = SessionRuntimeError::Store(error);
+                    self.record_execution_failure(
+                        thread_key,
+                        &execution.execution.execution_id,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                if let Err(error) = self.store.touch_session_sandbox_activity(thread_key).await {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_sandbox_activity_touch_failed",
+                        thread_key = %thread_key,
+                        %error,
+                        "failed to touch sandbox activity after initial message append"
+                    );
+                }
+                self.spawn_session_title_generation(thread_key);
+            }
+            let execution =
+                if !execution.created && execution.execution.status != ExecutionStatus::Queued {
+                    if execution_input_delivered(&execution.execution)
+                        || execution.execution.status != ExecutionStatus::Running
+                    {
+                        info!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_execute_idempotent_replay",
+                            thread_key = %thread_key,
+                            execution_id = %execution.execution.execution_id,
+                            status = %execution.execution.status,
+                            "returning existing execution"
+                        );
+                        return Ok(execution.execution);
+                    }
+                    execution.execution
+                } else {
+                    let claim = self
+                        .store
+                        .mark_execution_running(&execution.execution.execution_id)
+                        .await?;
+                    let execution = claim.execution;
+                    span.record("centaur.execution_id", execution.execution_id.as_str());
+                    span.record("execution_id", execution.execution_id.as_str());
+                    if !claim.claimed {
+                        if execution.status == ExecutionStatus::Running
+                            && !execution_input_delivered(&execution)
+                        {
+                            execution
+                        } else {
+                            info!(
+                                component = COMPONENT_SESSION_RUNTIME,
+                                event = "session_execute_not_claimed",
+                                thread_key = %thread_key,
+                                execution_id = %execution.execution_id,
+                                status = %execution.status,
+                                "execution was already claimed or terminal"
+                            );
+                            return Ok(execution);
+                        }
+                    } else {
+                        execution
+                    }
+                };
             span.record("centaur.execution_id", execution.execution_id.as_str());
             span.record("execution_id", execution.execution_id.as_str());
-            if !claim.claimed {
-                // A concurrent request with the same idempotency key claimed
-                // the execution first (or it already reached a terminal
-                // state). Do not drive it again — return the current row so
-                // the caller can attach to the event stream.
+            let claimed_input_delivery = self
+                .store
+                .claim_execution_input_delivery(
+                    &execution.execution_id,
+                    &self.stdout_owner_id,
+                    INPUT_DELIVERY_CLAIM_LEASE,
+                )
+                .await?;
+            if !claimed_input_delivery {
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_execute_not_claimed",
+                    event = "session_execute_input_delivery_claim_busy",
                     thread_key = %thread_key,
                     execution_id = %execution.execution_id,
-                    status = %execution.status,
-                    "execution was already claimed or terminal"
+                    "returning existing execution while input delivery claim is live"
                 );
                 return Ok(execution);
             }
@@ -1892,6 +2202,7 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
+            drop(lifecycle_fence);
             let execution_trace_span = info_span!(
                 "centaur.api_rs.session.execution",
                 component = COMPONENT_SESSION_RUNTIME,
@@ -1986,6 +2297,11 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
+            let execution = self
+                .store
+                .mark_execution_input_delivered(&execution.execution_id, &self.stdout_owner_id)
+                .await?
+                .unwrap_or(execution);
 
             if let Some(max_duration) = max_duration {
                 spawn_max_duration_failure(
@@ -2025,6 +2341,152 @@ impl SessionRuntime {
         result
     }
 
+    pub async fn execution_status(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: Option<&str>,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.execution_status_unchecked(thread_key, execution_id)
+            .await
+    }
+
+    async fn execution_status_unchecked(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: Option<&str>,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        let latest = self.store.latest_execution_for_thread(thread_key).await?;
+        if execution_id.is_none()
+            || latest
+                .as_ref()
+                .is_some_and(|execution| Some(execution.execution_id.as_str()) == execution_id)
+        {
+            return Ok(latest.map(|execution| execution.status));
+        }
+
+        // The store intentionally exposes only the latest execution row for a
+        // thread. For an older explicitly selected execution, terminal events
+        // are also durable state and cannot be skipped by a caller's cursor.
+        let events = self
+            .store
+            .list_events_after(thread_key, 0, execution_id, i64::MAX)
+            .await?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.event_type.as_str() {
+                "session.execution_completed" => Some(ExecutionStatus::Completed),
+                "session.execution_failed" => Some(ExecutionStatus::Failed),
+                "session.execution_cancelled" => Some(ExecutionStatus::Cancelled),
+                _ => None,
+            }))
+    }
+
+    pub async fn external_execution(
+        &self,
+        execution_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let Some(execution) = self.store.execution(execution_id).await? else {
+            return Ok(None);
+        };
+        if !is_mcp_agent_thread(&execution.thread_key) {
+            return Ok(None);
+        }
+        let session = self.store.get_session(&execution.thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        Ok(Some(execution))
+    }
+
+    pub async fn external_execution_status(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        Ok(self
+            .store
+            .execution_for_thread(thread_key, execution_id)
+            .await?
+            .map(|execution| execution.status))
+    }
+
+    pub async fn external_terminal_event_observed(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        status: &ExecutionStatus,
+        principal_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        Ok(self
+            .external_terminal_event_id(thread_key, execution_id, status, principal_id)
+            .await?
+            .is_some())
+    }
+
+    pub async fn external_terminal_event_observed_after(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        status: &ExecutionStatus,
+        after_event_id: i64,
+        principal_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        Ok(self
+            .external_terminal_event_id(thread_key, execution_id, status, principal_id)
+            .await?
+            .is_some_and(|terminal_event_id| after_event_id >= terminal_event_id))
+    }
+
+    pub async fn external_terminal_event_id(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        status: &ExecutionStatus,
+        principal_id: &str,
+    ) -> Result<Option<i64>, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        if self
+            .store
+            .execution_for_thread(thread_key, execution_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(event_type) = terminal_event_type_for_status(status) else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .execution_event_id(execution_id, event_type)
+            .await?)
+    }
+
     async fn record_execution_failure(
         &self,
         thread_key: &ThreadKey,
@@ -2033,32 +2495,49 @@ impl SessionRuntime {
     ) {
         self.execution_spans.lock().await.remove(execution_id);
         let error_message = error.to_string();
+        let payload = || {
+            json!({
+                "execution_id": execution_id,
+                "thread_key": thread_key.as_str(),
+                "error": error_message,
+            })
+        };
         let execution = match self
             .store
-            .fail_execution_if_active_and_stdout_owner(
+            .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
                 execution_id,
-                &self.stdout_owner_id,
-                &error_message,
-            )
+                owner_id: Some(&self.stdout_owner_id),
+                status: ExecutionStatus::Failed,
+                session_status: SessionStatus::Failed,
+                error: Some(&error_message),
+                event_type: "session.execution_failed",
+                payload: payload(),
+                clear_sandbox_id: None,
+                extra_event: None,
+            })
             .await
         {
-            Ok(Some(execution)) => execution,
-            Ok(None) => return,
+            Ok(Some(terminal)) => terminal.execution,
+            Ok(None) => match self
+                .store
+                .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
+                    execution_id,
+                    owner_id: None,
+                    status: ExecutionStatus::Failed,
+                    session_status: SessionStatus::Failed,
+                    error: Some(&error_message),
+                    event_type: "session.execution_failed",
+                    payload: payload(),
+                    clear_sandbox_id: None,
+                    extra_event: None,
+                })
+                .await
+            {
+                Ok(Some(terminal)) => terminal.execution,
+                Ok(None) | Err(_) => return,
+            },
             Err(_) => return,
         };
-        let _ = self
-            .store
-            .append_event(
-                thread_key,
-                Some(execution_id),
-                "session.execution_failed",
-                json!({
-                    "execution_id": execution_id,
-                    "thread_key": thread_key.as_str(),
-                    "error": error_message,
-                }),
-            )
-            .await;
         record_finished_execution_metric(
             &self.store,
             thread_key,
@@ -2151,13 +2630,59 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         reason: &str,
     ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
         let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
             return Ok(InterruptExecutionOutcome {
                 interrupted: false,
                 execution_id: None,
             });
         };
+        self.interrupt_execution(thread_key, execution, reason)
+            .await
+    }
 
+    pub async fn interrupt_external_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        reason: &str,
+        principal_id: &str,
+    ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        let _lifecycle_fence = self
+            .store
+            .acquire_session_lifecycle_fence(thread_key, SESSION_LIFECYCLE_FENCE_TIMEOUT)
+            .await?;
+        let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
+            return Ok(InterruptExecutionOutcome {
+                interrupted: false,
+                execution_id: Some(execution_id.to_owned()),
+            });
+        };
+        if execution.execution_id != execution_id {
+            return Ok(InterruptExecutionOutcome {
+                interrupted: false,
+                execution_id: Some(execution_id.to_owned()),
+            });
+        }
+        self.interrupt_execution(thread_key, execution, reason)
+            .await
+    }
+
+    async fn interrupt_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution: SessionExecution,
+        reason: &str,
+    ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
         let execution_span = self
             .execution_spans
             .lock()
@@ -2175,14 +2700,26 @@ impl SessionRuntime {
             .wait_for_active_steering_pipe(thread_key, &execution.execution_id)
             .await
             .map_err(SessionRuntimeError::BadRequest)?;
-        write_input_lines(
-            &pipe,
-            &input_lines,
-            thread_key,
-            &execution.execution_id,
-            None,
+        match timeout(
+            STEERING_STARTUP_RETRY_TIMEOUT,
+            write_input_lines(
+                &pipe,
+                &input_lines,
+                thread_key,
+                &execution.execution_id,
+                None,
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(SessionRuntimeError::BadRequest(format!(
+                    "timed out delivering interrupt to execution {}",
+                    execution.execution_id
+                )));
+            }
+        }
 
         self.store
             .append_event(
@@ -2276,6 +2813,7 @@ impl SessionRuntime {
             execution_id = execution_id.unwrap_or(""),
         );
         let result = async {
+            reject_mcp_agent_raw_thread(thread_key)?;
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_events_stream_started",
@@ -3058,6 +3596,57 @@ impl SessionRuntime {
                 "orphan adoption scan found nothing adoptable"
             );
         }
+    }
+
+    pub async fn list_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        reject_mcp_agent_raw_thread(thread_key)?;
+        self.list_events_unchecked(thread_key, after_event_id, execution_id, limit)
+            .await
+    }
+
+    pub async fn list_external_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+        principal_id: &str,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        require_external_agent_thread(thread_key)?;
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        let session = self.store.get_session(thread_key).await?;
+        validate_external_principal(&session, principal_id)?;
+        self.list_events_unchecked(thread_key, after_event_id, execution_id, limit)
+            .await
+    }
+
+    async fn list_events_unchecked(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        if limit <= 0 {
+            return Err(SessionRuntimeError::BadRequest(
+                "limit must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(self
+            .store
+            .list_events_after(thread_key, after_event_id, execution_id, limit)
+            .await?)
     }
 
     async fn record_adoption_deferral(&self, execution: &SessionExecution) {
@@ -3845,6 +4434,15 @@ fn is_terminal_execution_event(event_type: &str) -> bool {
         event_type,
         "session.execution_completed" | "session.execution_failed" | "session.execution_cancelled"
     )
+}
+
+fn terminal_event_type_for_status(status: &ExecutionStatus) -> Option<&'static str> {
+    match status {
+        ExecutionStatus::Completed => Some("session.execution_completed"),
+        ExecutionStatus::Failed => Some("session.execution_failed"),
+        ExecutionStatus::Cancelled => Some("session.execution_cancelled"),
+        ExecutionStatus::Queued | ExecutionStatus::Running => None,
+    }
 }
 
 /// How a stdout pump pass ended once the attach stream closed.
@@ -5069,18 +5667,12 @@ async fn record_terminal_output(
     terminal: TerminalOutput,
 ) -> Result<(), SessionRuntimeError> {
     let mut failure_class = None;
-    let (terminal_execution, terminal_status) = match terminal {
+    let (status, session_status, error_text, event_type, payload, terminal_status) = match terminal
+    {
         TerminalOutput::Completed {
             reason,
             result_text,
         } => {
-            let Some(execution) = ctx
-                .store
-                .complete_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id)
-                .await?
-            else {
-                return Ok(());
-            };
             let mut payload = json!({
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
@@ -5091,70 +5683,61 @@ async fn record_terminal_output(
             {
                 object.insert("result_text".to_owned(), json!(result_text));
             }
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_completed",
-                    payload,
-                )
-                .await?;
-            (execution, "completed")
+            (
+                ExecutionStatus::Completed,
+                SessionStatus::Idle,
+                None,
+                "session.execution_completed",
+                payload,
+                "completed",
+            )
         }
-        TerminalOutput::Cancelled { reason } => {
-            let Some(execution) = ctx
-                .store
-                .cancel_execution_if_active_and_stdout_owner(
-                    execution_id,
-                    &ctx.stdout_owner_id,
-                    reason,
-                )
-                .await?
-            else {
-                return Ok(());
-            };
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_cancelled",
-                    json!({
-                        "execution_id": execution_id,
-                        "thread_key": thread_key.as_str(),
-                        "reason": reason,
-                    }),
-                )
-                .await?;
-            (execution, "cancelled")
-        }
+        TerminalOutput::Cancelled { reason } => (
+            ExecutionStatus::Cancelled,
+            SessionStatus::Idle,
+            Some(reason.to_owned()),
+            "session.execution_cancelled",
+            json!({
+                "execution_id": execution_id,
+                "thread_key": thread_key.as_str(),
+                "reason": reason,
+            }),
+            "cancelled",
+        ),
         TerminalOutput::Failed { error } => {
             failure_class = Some(terminal_failure_class(&error));
-            let Some(execution) = ctx
-                .store
-                .fail_execution_if_active_and_stdout_owner(
-                    execution_id,
-                    &ctx.stdout_owner_id,
-                    &error,
-                )
-                .await?
-            else {
-                return Ok(());
-            };
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_failed",
-                    json!({
-                        "execution_id": execution_id,
-                        "thread_key": thread_key.as_str(),
-                        "error": error.as_str(),
-                    }),
-                )
-                .await?;
-            (execution, "failed")
+            (
+                ExecutionStatus::Failed,
+                SessionStatus::Failed,
+                Some(error.clone()),
+                "session.execution_failed",
+                json!({
+                    "execution_id": execution_id,
+                    "thread_key": thread_key.as_str(),
+                    "error": error.as_str(),
+                }),
+                "failed",
+            )
         }
     };
+    let Some(terminal) = ctx
+        .store
+        .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
+            execution_id,
+            owner_id: Some(&ctx.stdout_owner_id),
+            status,
+            session_status,
+            error: error_text.as_deref(),
+            event_type,
+            payload,
+            clear_sandbox_id: None,
+            extra_event: None,
+        })
+        .await?
+    else {
+        return Ok(());
+    };
+    let terminal_execution = terminal.execution;
     ctx.execution_spans.lock().await.remove(execution_id);
     if let Err(error) = ctx
         .store
@@ -5248,40 +5831,90 @@ async fn record_max_duration_failure(
     max_duration: Duration,
     idle_timeout: Option<Duration>,
 ) -> Result<(), SessionRuntimeError> {
-    let max_duration_ms = duration_millis_u64(max_duration);
-    let error = format!("execution exceeded max_duration_ms={max_duration_ms}");
-    let Some(execution) = ctx
+    let _lifecycle_fence = ctx
         .store
-        .fail_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id, &error)
-        .await?
-    else {
+        .acquire_session_lifecycle_fence(thread_key, SESSION_LIFECYCLE_FENCE_TIMEOUT)
+        .await?;
+    let Some(active_execution) = ctx.store.active_execution_for_thread(thread_key).await? else {
         return Ok(());
     };
-    ctx.execution_spans.lock().await.remove(execution_id);
-    if let Err(error) = ctx.store.touch_session_sandbox_activity(thread_key).await {
-        warn!(
-            component = COMPONENT_SESSION_RUNTIME,
-            event = "session_sandbox_activity_touch_failed",
-            thread_key = %thread_key,
-            execution_id,
-            %error,
-            "failed to touch sandbox activity after max duration"
-        );
+    if active_execution.execution_id != execution_id {
+        return Ok(());
     }
-    ctx.store
-        .append_event(
-            thread_key,
-            Some(execution_id),
-            "session.execution_failed",
-            json!({
+    let session = ctx.store.get_session(thread_key).await?;
+    let sandbox_id = session.sandbox_id.clone();
+    let quarantine_reason = if let Some(sandbox_id) = sandbox_id.as_deref() {
+        let id = SandboxId::new(sandbox_id);
+        ctx.sandbox_pipes.remove(sandbox_id);
+        let stop_result =
+            timeout(SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT, ctx.manager.stop(&id)).await;
+        Some(match stop_result {
+            Ok(Ok(())) | Ok(Err(SandboxError::NotFound(_))) => "stopped",
+            Ok(Err(error)) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_sandbox_timeout_stop_failed",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    %error,
+                    "failed to stop timed-out execution sandbox; clearing durable reference for cleanup retry"
+                );
+                "stop_failed"
+            }
+            Err(_) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_sandbox_timeout_stop_timed_out",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    "timed out stopping timed-out execution sandbox; clearing durable reference for cleanup retry"
+                );
+                "stop_timed_out"
+            }
+        })
+    } else {
+        None
+    };
+
+    let max_duration_ms = duration_millis_u64(max_duration);
+    let error = format!("execution exceeded max_duration_ms={max_duration_ms}");
+    let Some(terminal) = ctx
+        .store
+        .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
+            execution_id,
+            owner_id: Some(&ctx.stdout_owner_id),
+            status: ExecutionStatus::Failed,
+            session_status: SessionStatus::Failed,
+            error: Some(&error),
+            event_type: "session.execution_failed",
+            payload: json!({
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
                 "error": error,
                 "reason": "max_duration_exceeded",
                 "max_duration_ms": max_duration_ms,
             }),
-        )
-        .await?;
+            clear_sandbox_id: sandbox_id.as_deref(),
+            extra_event: sandbox_id.as_deref().zip(quarantine_reason).map(
+                |(sandbox_id, stop_result)| TerminalExecutionExtraEvent {
+                    event_type: "session.sandbox_quarantined".to_owned(),
+                    payload: json!({
+                        "execution_id": execution_id,
+                        "thread_key": thread_key.as_str(),
+                        "sandbox_id": sandbox_id,
+                        "reason": "max_duration_exceeded",
+                        "stop_result": stop_result,
+                    }),
+                },
+            ),
+        })
+        .await?
+    else {
+        return Ok(());
+    };
+    let execution = terminal.execution;
     record_finished_execution_metric(
         &ctx.store,
         thread_key,
@@ -5291,7 +5924,7 @@ async fn record_max_duration_failure(
     )
     .await;
     if let Some(idle_timeout) = idle_timeout.or_else(|| idle_timeout_from_execution(&execution))
-        && let Some(sandbox_id) = ctx.store.get_session(thread_key).await?.sandbox_id
+        && let Some(sandbox_id) = sandbox_id
     {
         spawn_idle_pause(
             ctx.clone(),
@@ -5328,6 +5961,10 @@ async fn record_idle_pause(
     sandbox_id: &str,
     idle_timeout: Duration,
 ) -> Result<(), SessionRuntimeError> {
+    let _lifecycle_fence = ctx
+        .store
+        .acquire_session_lifecycle_fence(thread_key, SESSION_LIFECYCLE_FENCE_TIMEOUT)
+        .await?;
     let latest_execution = ctx.store.latest_execution_for_thread(thread_key).await?;
     let session = ctx.store.get_session(thread_key).await?;
     if !should_pause_idle_sandbox(
@@ -5362,8 +5999,8 @@ async fn record_idle_pause(
     }
 
     ctx.sandbox_pipes.remove(sandbox_id);
-    match ctx.manager.pause(&id).await {
-        Ok(()) => {
+    match timeout(SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT, ctx.manager.pause(&id)).await {
+        Ok(Ok(())) => {
             ctx.store
                 .append_event(
                     thread_key,
@@ -5379,7 +6016,7 @@ async fn record_idle_pause(
                 )
                 .await?;
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             record_idle_pause_failure(
                 &ctx.store,
                 thread_key,
@@ -5390,6 +6027,20 @@ async fn record_idle_pause(
             )
             .await?;
             return Err(SessionRuntimeError::Sandbox(error));
+        }
+        Err(_) => {
+            let error =
+                format!("timed out pausing sandbox {sandbox_id} after execution {execution_id}");
+            record_idle_pause_failure(
+                &ctx.store,
+                thread_key,
+                execution_id,
+                sandbox_id,
+                idle_timeout,
+                &error,
+            )
+            .await?;
+            return Err(SessionRuntimeError::BadRequest(error));
         }
     }
     Ok(())
@@ -6525,7 +7176,7 @@ fn tool_host_thread_key(principal_id: &str) -> Result<ThreadKey, SessionRuntimeE
 fn tool_host_session_metadata(principal_id: &str) -> Value {
     json!({
         "mcp_tool_host": true,
-        "mcp_principal_id": principal_id,
+        "agent_principal_id": principal_id,
     })
 }
 
@@ -6590,6 +7241,20 @@ fn execution_metadata(
         }
     }
     metadata
+}
+
+fn execution_metadata_matches_requested(existing: &Value, requested: &Value) -> bool {
+    let mut existing = existing.clone();
+    if let Value::Object(object) = &mut existing {
+        object.remove("input_delivered_at");
+        object.remove("input_delivery_claim_owner");
+        object.remove("input_delivery_claim_expires_at");
+    }
+    existing == *requested
+}
+
+fn execution_input_delivered(execution: &SessionExecution) -> bool {
+    execution.metadata.get("input_delivered_at").is_some()
 }
 
 fn idle_timeout_from_execution(execution: &SessionExecution) -> Option<Duration> {
@@ -6662,6 +7327,56 @@ mod tests {
     use serde_json::json;
     use time::OffsetDateTime;
 
+    #[test]
+    fn derived_principals_cannot_claim_mcp_agent_threads() {
+        let mcp_thread = ThreadKey::parse("agent:principal:request").unwrap();
+        let ordinary_thread = ThreadKey::parse("slack:thread").unwrap();
+
+        assert!(
+            validate_session_principal_source(&mcp_thread, SessionPrincipalSource::Derived)
+                .is_err()
+        );
+        assert!(
+            validate_session_principal_source(
+                &mcp_thread,
+                SessionPrincipalSource::Existing("principal"),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_principal_source(&ordinary_thread, SessionPrincipalSource::Derived)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn raw_runtime_entrypoints_reject_mcp_agent_threads() {
+        let mcp_thread = ThreadKey::parse("agent:principal:request").unwrap();
+
+        assert!(reject_mcp_agent_raw_thread(&mcp_thread).is_err());
+    }
+
+    #[test]
+    fn external_principal_validation_rejects_cross_principal_session() {
+        let now = OffsetDateTime::now_utc();
+        let session = Session {
+            thread_key: ThreadKey::parse("agent:principal:request").unwrap(),
+            title: None,
+            sandbox_id: None,
+            sandbox_capabilities: None,
+            harness_type: HarnessType::Codex,
+            harness_thread_id: None,
+            persona_id: None,
+            status: SessionStatus::Idle,
+            iron_control_principal: Some("principal-a".to_owned()),
+            sandbox_last_active_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(validate_external_principal(&session, "principal-a").is_ok());
+        assert!(validate_external_principal(&session, "principal-b").is_err());
+    }
     #[test]
     fn sandbox_repo_cache_label_controls_access() {
         assert_eq!(
@@ -8021,8 +8736,9 @@ mod adoption_tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    use centaur_iron_control::{IronControlClient, SessionRegistrar};
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
 
@@ -8043,6 +8759,8 @@ mod adoption_tests {
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<(String, String)>>,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
+        stop_fails: AtomicBool,
+        stop_blocks: AtomicBool,
     }
 
     impl MockBackend {
@@ -8059,6 +8777,8 @@ mod adoption_tests {
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
+                stop_fails: AtomicBool::new(false),
+                stop_blocks: AtomicBool::new(false),
             }
         }
 
@@ -8095,6 +8815,14 @@ mod adoption_tests {
 
         fn fail_resume(&self) {
             self.resume_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_stop(&self) {
+            self.stop_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn block_stop(&self) {
+            self.stop_blocks.store(true, Ordering::SeqCst);
         }
 
         fn mark_stop_missing(&self, sandbox_id: &str) {
@@ -8172,6 +8900,12 @@ mod adoption_tests {
         }
 
         async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            if self.stop_blocks.load(Ordering::SeqCst) {
+                sleep(SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT + Duration::from_secs(1)).await;
+            }
+            if self.stop_fails.load(Ordering::SeqCst) {
+                return Err(SandboxError::io("mock stop failed"));
+            }
             if self.missing_on_stop.lock().unwrap().contains(id.as_str()) {
                 return Err(SandboxError::NotFound(id.as_str().to_owned()));
             }
@@ -8362,6 +9096,1077 @@ mod adoption_tests {
             store.clone(),
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
         )
+    }
+
+    async fn spawn_external_principal_stub() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                seen.lock().unwrap().push(first_line.to_owned());
+                let (status, body) = if first_line
+                    .starts_with("GET /api/v1/principals/prn_mcp_caller ")
+                {
+                    (
+                        "200 OK",
+                        r#"{"data":{"id":"prn_mcp_caller","namespace":"default","foreign_id":"mcp-user","name":"MCP User","labels":{"centaur.sandbox_repo_cache":"public"},"sandbox_observability_enabled":false,"sandbox_api_server_enabled":false}}"#,
+                    )
+                } else {
+                    ("500 Internal Server Error", r#"{"error":"unexpected"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_session_uses_existing_principal_without_registering_thread_principal() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_external_principal_stub().await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_default".to_owned()],
+        );
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        )
+        .with_iron_control(registrar);
+        let thread_key = ThreadKey::parse(format!("agent:test:{}", uuid::Uuid::new_v4())).unwrap();
+
+        let outcome = runtime
+            .create_or_get_external_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"agent_api": true})),
+                HarnessConflictPolicy::Reject,
+                "prn_mcp_caller",
+            )
+            .await
+            .expect("create external session");
+
+        assert_eq!(
+            outcome.session.iron_control_principal.as_deref(),
+            Some("prn_mcp_caller")
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/prn_mcp_caller HTTP/1.1"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_stream_events_rejects_mcp_agent_threads() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("agent:test:stream-{}", uuid::Uuid::new_v4())).unwrap();
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let error = match runtime.stream_events(&thread_key, 0, None).await {
+            Ok(_) => panic!("raw stream_events must reject mcp-agent threads"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SessionRuntimeError::BadRequest(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_external_cancel_does_not_interrupt_newer_active_execution() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("agent:test:cancel-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let old_execution = store
+            .create_execution(&thread_key, Some("old"), json!({}))
+            .await
+            .expect("create old execution")
+            .execution;
+        store
+            .mark_execution_running(&old_execution.execution_id)
+            .await
+            .expect("mark old running");
+        backdate_execution(&store, &old_execution.execution_id, 10.0).await;
+        store
+            .fail_execution_if_active(&old_execution.execution_id, "superseded")
+            .await
+            .expect("terminalize old execution before new start");
+        let new_execution = store
+            .create_execution(&thread_key, Some("new"), json!({}))
+            .await
+            .expect("create new execution")
+            .execution;
+        store
+            .mark_execution_running(&new_execution.execution_id)
+            .await
+            .expect("mark new running");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let outcome = runtime
+            .interrupt_external_execution(
+                &thread_key,
+                &old_execution.execution_id,
+                "too late",
+                "principal-a",
+            )
+            .await
+            .expect("cancel old execution");
+
+        assert!(!outcome.interrupted);
+        assert_eq!(
+            outcome.execution_id.as_deref(),
+            Some(old_execution.execution_id.as_str())
+        );
+        let delivered = store
+            .list_events_after(&thread_key, 0, Some(&new_execution.execution_id), 100)
+            .await
+            .expect("list new execution events")
+            .into_iter()
+            .any(|event| event.event_type == "session.interrupt_delivered");
+        assert!(!delivered, "new execution must not receive old cancel");
+
+        store
+            .fail_execution_if_active(&old_execution.execution_id, "test cleanup")
+            .await
+            .expect("old execution already terminal");
+        store
+            .fail_execution_if_active(&new_execution.execution_id, "test cleanup")
+            .await
+            .expect("clean new execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_start_waits_for_session_lifecycle_fence() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:lifecycle-start-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout_far, _stdin_far) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        let fence = store
+            .acquire_session_lifecycle_fence(&thread_key, Duration::from_secs(5))
+            .await
+            .expect("acquire lifecycle fence");
+        let runtime_for_start = runtime.clone();
+        let thread_for_start = thread_key.clone();
+        let starter = tokio::spawn(async move {
+            runtime_for_start
+                .execute_session(
+                    &thread_for_start,
+                    ExecuteSessionInput {
+                        idempotency_key: Some("new".to_owned()),
+                        metadata: None,
+                        input_lines: vec![json!({"type": "user", "text": "hello"}).to_string()],
+                        idle_timeout_ms: None,
+                        max_duration_ms: None,
+                    },
+                )
+                .await
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("latest execution while fenced")
+                .is_none(),
+            "execution creation must wait behind an in-flight lifecycle transition"
+        );
+        drop(fence);
+        let execution = timeout(Duration::from_secs(5), starter)
+            .await
+            .expect("execution start should finish after fence release")
+            .expect("starter task")
+            .expect("execution start");
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("clean execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_duration_stops_sandbox_before_terminal_failure() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:lifecycle-timeout-{}", uuid::Uuid::new_v4())).unwrap();
+        let sandbox_id = "sbx-timeout-fence";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .expect("set sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend.clone());
+        let execution = store
+            .create_execution(&thread_key, Some("timeout"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .expect("mark running");
+        store
+            .claim_stdout_owner(
+                &execution.execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim stdout owner");
+
+        record_max_duration_failure(
+            &runtime.context(),
+            &thread_key,
+            &execution.execution_id,
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .expect("record max duration failure");
+
+        assert_eq!(backend.stopped(), vec![sandbox_id.to_owned()]);
+        let failed = store
+            .execution(&execution.execution_id)
+            .await
+            .expect("read execution")
+            .expect("execution exists");
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        let events = store
+            .list_events_after(&thread_key, 0, Some(&execution.execution_id), 100)
+            .await
+            .expect("list events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "terminal failure event must be recorded only after sandbox stop succeeds"
+        );
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None,
+            "timed-out sandbox reference must be cleared before the terminal row is visible"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.sandbox_quarantined"),
+            "timeout teardown must arrange an unreferenced sandbox cleanup retry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_transition_requires_atomic_event_write() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:lifecycle-terminal-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let sandbox_id = "sbx-terminal-atomic";
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .expect("set sandbox");
+        let execution = store
+            .create_execution(&thread_key, Some("terminal-atomic"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        store
+            .claim_stdout_owner(&execution.execution_id, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let wrong_owner = store
+            .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
+                execution_id: &execution.execution_id,
+                owner_id: Some("owner-b"),
+                status: ExecutionStatus::Failed,
+                session_status: SessionStatus::Failed,
+                error: Some("wrong owner"),
+                event_type: "session.execution_failed",
+                payload: json!({"execution_id": execution.execution_id, "error": "wrong owner"}),
+                clear_sandbox_id: Some(sandbox_id),
+                extra_event: None,
+            })
+            .await
+            .expect("wrong owner terminal attempt");
+        assert!(wrong_owner.is_none());
+        assert_eq!(
+            store
+                .execution(&execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+        assert!(
+            events(&store, &thread_key)
+                .await
+                .iter()
+                .all(|event| event.event_type != "session.execution_failed")
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some(sandbox_id),
+            "failed terminal attempt must not clear sandbox"
+        );
+
+        let terminal = store
+            .terminal_execution_event_if_active_and_stdout_owner(TerminalExecutionEventInput {
+                execution_id: &execution.execution_id,
+                owner_id: Some("owner-a"),
+                status: ExecutionStatus::Failed,
+                session_status: SessionStatus::Failed,
+                error: Some("atomic failure"),
+                event_type: "session.execution_failed",
+                payload: json!({"execution_id": execution.execution_id, "error": "atomic failure"}),
+                clear_sandbox_id: Some(sandbox_id),
+                extra_event: None,
+            })
+            .await
+            .expect("terminal transition")
+            .expect("terminal result");
+        assert_eq!(terminal.execution.status, ExecutionStatus::Failed);
+        assert_eq!(terminal.event.event_type, "session.execution_failed");
+        assert_eq!(
+            store
+                .execution(&execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None,
+            "terminal transaction must clear the expected sandbox atomically"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idempotent_retry_resumes_running_execution_before_input_delivery() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:lifecycle-retry-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let execution = store
+            .create_execution(&thread_key, Some("retry"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout_far, _stdin_far) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+
+        let resumed = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some("retry".to_owned()),
+                    metadata: None,
+                    input_lines: vec![json!({"type": "user", "text": "retry"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("resume startup");
+
+        assert_eq!(resumed.execution_id, execution.execution_id);
+        let persisted = store
+            .execution(&execution.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(execution_input_delivered(&persisted));
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("clean execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idempotent_retry_waits_for_live_input_delivery_claim_and_recovers_after_expiry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+
+        let busy_thread = ThreadKey::parse(format!(
+            "test:lifecycle-retry-busy-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(&busy_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .unwrap();
+        let busy = store
+            .create_execution(&busy_thread, Some("retry-busy"), json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&busy.execution_id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_stdout_owner(&busy.execution_id, "peer", Duration::from_millis(1))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_execution_input_delivery(&busy.execution_id, "peer", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        sleep(Duration::from_millis(20)).await;
+        let busy_backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let busy_runtime = runtime_with(&store, busy_backend.clone());
+        let replay = busy_runtime
+            .execute_session(
+                &busy_thread,
+                ExecuteSessionInput {
+                    idempotency_key: Some("retry-busy".to_owned()),
+                    metadata: None,
+                    input_lines: vec![json!({"type": "user", "text": "retry"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.execution_id, busy.execution_id);
+        assert_eq!(busy_backend.opens(), 0);
+        assert!(!execution_input_delivered(
+            &store.execution(&busy.execution_id).await.unwrap().unwrap()
+        ));
+        assert!(
+            store
+                .claim_stdout_owner(&busy.execution_id, "third", Duration::from_secs(60))
+                .await
+                .unwrap(),
+            "retry must not renew/steal stdout while input delivery claim is live"
+        );
+        store
+            .fail_execution_if_active(&busy.execution_id, "test cleanup")
+            .await
+            .unwrap();
+
+        let expired_thread = ThreadKey::parse(format!(
+            "test:lifecycle-retry-expired-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(&expired_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .unwrap();
+        let expired = store
+            .create_execution(&expired_thread, Some("retry-expired"), json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&expired.execution_id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_execution_input_delivery(
+                    &expired.execution_id,
+                    "peer",
+                    Duration::from_millis(1)
+                )
+                .await
+                .unwrap()
+        );
+        sleep(Duration::from_millis(20)).await;
+        let expired_backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout_far, _stdin_far) = mock_io();
+        expired_backend.push_io(io).await;
+        let expired_runtime = runtime_with(&store, expired_backend);
+        let resumed = expired_runtime
+            .execute_session(
+                &expired_thread,
+                ExecuteSessionInput {
+                    idempotency_key: Some("retry-expired".to_owned()),
+                    metadata: None,
+                    input_lines: vec![json!({"type": "user", "text": "retry"}).to_string()],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.execution_id, expired.execution_id);
+        assert!(execution_input_delivered(
+            &store
+                .execution(&expired.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+        ));
+        store
+            .fail_execution_if_active(&expired.execution_id, "test cleanup")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_duration_terminalizes_and_quarantines_when_stop_fails() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "test:lifecycle-stop-fails-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let sandbox_id = "sbx-timeout-stop-fails";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .expect("set sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        backend.fail_stop();
+        let runtime = runtime_with(&store, backend);
+        let execution = store
+            .create_execution(&thread_key, Some("timeout-stop-fails"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        store
+            .claim_stdout_owner(
+                &execution.execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        record_max_duration_failure(
+            &runtime.context(),
+            &thread_key,
+            &execution.execution_id,
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .expect("record timeout despite stop failure");
+
+        assert_eq!(
+            store
+                .execution(&execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None
+        );
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.execution_failed")
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.sandbox_quarantined"
+                && event.payload["stop_result"] == json!("stop_failed")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_duration_terminalizes_and_quarantines_when_stop_times_out() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "test:lifecycle-stop-timeout-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let sandbox_id = "sbx-timeout-stop-timeout";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .expect("set sandbox");
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        backend.block_stop();
+        let runtime = runtime_with(&store, backend);
+        let execution = store
+            .create_execution(&thread_key, Some("timeout-stop-timeout"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        store
+            .claim_stdout_owner(
+                &execution.execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        record_max_duration_failure(
+            &runtime.context(),
+            &thread_key,
+            &execution.execution_id,
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .expect("record timeout despite stop timeout");
+
+        assert_eq!(
+            store
+                .execution(&execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None
+        );
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.execution_failed")
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.sandbox_quarantined"
+                && event.payload["stop_result"] == json!("stop_timed_out")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_pause_skips_when_new_execution_started() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:lifecycle-idle-{}", uuid::Uuid::new_v4())).unwrap();
+        let sandbox_id = "sbx-idle-fence";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .expect("set sandbox");
+        let old_execution = store
+            .create_execution(&thread_key, Some("old"), json!({"idle_timeout_ms": 1}))
+            .await
+            .expect("create old execution")
+            .execution;
+        store
+            .complete_execution(&old_execution.execution_id)
+            .await
+            .expect("complete old execution");
+        let new_execution = store
+            .create_execution(&thread_key, Some("new"), json!({}))
+            .await
+            .expect("create new execution")
+            .execution;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend.clone());
+
+        record_idle_pause(
+            &runtime.context(),
+            &thread_key,
+            &old_execution.execution_id,
+            sandbox_id,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("record idle pause");
+
+        assert_eq!(backend.status_of(sandbox_id), Some(SandboxStatus::Running));
+        let paused = store
+            .list_events_after(&thread_key, 0, Some(&old_execution.execution_id), 100)
+            .await
+            .expect("list old events")
+            .into_iter()
+            .any(|event| event.event_type == "session.sandbox_paused");
+        assert!(!paused, "idle pause must not suspend after a newer start");
+        store
+            .fail_execution_if_active(&new_execution.execution_id, "test cleanup")
+            .await
+            .expect("clean new execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_agent_api_rejects_non_agent_executions() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("console:test:{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("private"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        assert!(
+            runtime
+                .external_execution(&execution.execution_id, "principal-a")
+                .await
+                .expect("look up execution")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .list_external_events(
+                    &thread_key,
+                    0,
+                    Some(&execution.execution_id),
+                    100,
+                    "principal-a",
+                )
+                .await
+                .is_err()
+        );
+        store
+            .fail_execution_if_active(&execution.execution_id, "test cleanup")
+            .await
+            .expect("clean execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_cancel_preserves_terminal_target_execution_id() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "agent:test:terminal-cancel-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let outcome = runtime
+            .interrupt_external_execution(
+                &thread_key,
+                &execution.execution_id,
+                "too late",
+                "principal-a",
+            )
+            .await
+            .expect("cancel terminal execution");
+        assert!(!outcome.interrupted);
+        assert_eq!(
+            outcome.execution_id.as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_execution_status_survives_cursor_past_terminal_event() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("agent:test:status-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .set_iron_control_principal(&thread_key, Some("principal-a"))
+            .await
+            .expect("persist principal");
+        let execution = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create execution")
+            .execution;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+        let terminal_event = store
+            .append_event(
+                &thread_key,
+                Some(&execution.execution_id),
+                "session.execution_completed",
+                json!({"execution_id": execution.execution_id}),
+            )
+            .await
+            .expect("append terminal event");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        let page = runtime
+            .list_external_events(
+                &thread_key,
+                terminal_event.event_id,
+                Some(&execution.execution_id),
+                100,
+                "principal-a",
+            )
+            .await
+            .expect("list events after terminal cursor");
+        assert!(page.is_empty());
+        assert_eq!(
+            runtime
+                .external_execution_status(&thread_key, &execution.execution_id, "principal-a")
+                .await
+                .expect("read external status"),
+            Some(ExecutionStatus::Completed)
+        );
+        assert_eq!(
+            runtime
+                .external_terminal_event_id(
+                    &thread_key,
+                    &execution.execution_id,
+                    &ExecutionStatus::Completed,
+                    "principal-a",
+                )
+                .await
+                .expect("read terminal event id"),
+            Some(terminal_event.event_id)
+        );
+        assert!(
+            runtime
+                .external_terminal_event_observed_after(
+                    &thread_key,
+                    &execution.execution_id,
+                    &ExecutionStatus::Completed,
+                    terminal_event.event_id,
+                    "principal-a",
+                )
+                .await
+                .expect("check terminal event after cursor")
+        );
+        assert!(
+            !runtime
+                .external_terminal_event_observed_after(
+                    &thread_key,
+                    &execution.execution_id,
+                    &ExecutionStatus::Completed,
+                    terminal_event.event_id - 1,
+                    "principal-a",
+                )
+                .await
+                .expect("check terminal event before cursor"),
+            "earlier truncated pages must not report terminal_observed unless the page itself contains the terminal event"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_status_recovers_terminal_state_for_an_older_execution() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:terminal-status-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let terminal = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create terminal execution")
+            .execution;
+        store
+            .complete_execution(&terminal.execution_id)
+            .await
+            .expect("complete execution");
+        store
+            .append_event(
+                &thread_key,
+                Some(&terminal.execution_id),
+                "session.execution_completed",
+                json!({"execution_id": terminal.execution_id}),
+            )
+            .await
+            .expect("append terminal event");
+        let latest = store
+            .create_execution(&thread_key, Some("latest"), json!({}))
+            .await
+            .expect("create latest execution")
+            .execution;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        assert_eq!(
+            runtime
+                .execution_status(&thread_key, Some(&terminal.execution_id))
+                .await
+                .expect("read execution status"),
+            Some(ExecutionStatus::Completed)
+        );
+
+        store
+            .fail_execution_if_active(&latest.execution_id, "test cleanup")
+            .await
+            .expect("clean up latest execution");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9180,13 +10985,22 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        store
+            .claim_stdout_owner(
+                &execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim stdout owner");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-recorded")
             .await
@@ -9230,7 +11044,8 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (first_io, mut first_stdout, _first_stdin) = mock_io();
@@ -9239,6 +11054,14 @@ mod adoption_tests {
         backend.push_io(second_io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        store
+            .claim_stdout_owner(
+                &execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim stdout owner");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-reattach")
             .await
@@ -9281,13 +11104,21 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        store
+            .claim_stdout_owner(
+                &execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim stdout owner");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-gone")
             .await

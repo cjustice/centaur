@@ -10,7 +10,7 @@ use centaur_session_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{
-    FromRow, PgPool,
+    FromRow, PgPool, Postgres, Transaction,
     postgres::{PgListener, PgPoolOptions},
 };
 use thiserror::Error;
@@ -36,6 +36,31 @@ pub struct ClaimExecutionResult {
     /// `running`. False means another request already claimed it (or it is
     /// terminal), so the caller must not drive the execution.
     pub claimed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalExecutionExtraEvent {
+    pub event_type: String,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalExecutionEventInput<'a> {
+    pub execution_id: &'a str,
+    pub owner_id: Option<&'a str>,
+    pub status: ExecutionStatus,
+    pub session_status: SessionStatus,
+    pub error: Option<&'a str>,
+    pub event_type: &'a str,
+    pub payload: Value,
+    pub clear_sandbox_id: Option<&'a str>,
+    pub extra_event: Option<TerminalExecutionExtraEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalExecutionResult {
+    pub execution: SessionExecution,
+    pub event: SessionEvent,
 }
 
 /// An active execution whose stdout-owner lease was released by
@@ -86,6 +111,9 @@ pub struct WorkflowOwnedSandbox {
 pub struct PgSessionStore {
     pool: PgPool,
 }
+pub struct SessionLifecycleFence {
+    _tx: Transaction<'static, Postgres>,
+}
 
 impl PgSessionStore {
     pub fn new(pool: PgPool) -> Self {
@@ -113,6 +141,24 @@ impl PgSessionStore {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen(SESSION_EVENTS_CHANNEL).await?;
         Ok(SessionEventListener { listener })
+    }
+
+    pub async fn acquire_session_lifecycle_fence(
+        &self,
+        thread_key: &ThreadKey,
+        wait_timeout: Duration,
+    ) -> Result<SessionLifecycleFence, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let lock_timeout = format!("{}ms", wait_timeout.as_millis());
+        sqlx::query("select set_config('lock_timeout', $1, true)")
+            .bind(lock_timeout)
+            .execute(tx.as_mut())
+            .await?;
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(thread_key.as_str())
+            .execute(tx.as_mut())
+            .await?;
+        Ok(SessionLifecycleFence { _tx: tx })
     }
 
     pub async fn create_or_get_session(
@@ -431,6 +477,44 @@ impl PgSessionStore {
         row.map(TryInto::try_into).transpose()
     }
 
+    pub async fn execution_for_thread(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where thread_key = $1 and execution_id = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where execution_id = $1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn mark_execution_running(
         &self,
         execution_id: &str,
@@ -475,6 +559,69 @@ impl PgSessionStore {
             execution: row.try_into()?,
             claimed: true,
         })
+    }
+
+    pub async fn mark_execution_input_delivered(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set metadata = jsonb_set(
+                    metadata - 'input_delivery_claim_owner' - 'input_delivery_claim_expires_at',
+                    '{input_delivered_at}',
+                    to_jsonb(now()::text),
+                    true
+                ),
+                updated_at = now()
+            where execution_id = $1
+              and status in ($2, $3)
+              and metadata->>'input_delivery_claim_owner' = $4
+            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(execution_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .bind(owner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn claim_execution_input_delivery(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+        lease: Duration,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update session_executions
+            set metadata = jsonb_set(
+                    jsonb_set(metadata, '{input_delivery_claim_owner}', to_jsonb($2::text), true),
+                    '{input_delivery_claim_expires_at}',
+                    to_jsonb((now() + ($3::double precision * interval '1 second'))::text),
+                    true
+                ),
+                updated_at = now()
+            where execution_id = $1
+              and status = $4
+              and metadata->>'input_delivered_at' is null
+              and coalesce((metadata->>'input_delivery_claim_expires_at')::timestamptz <= now(), true)
+            "#,
+        )
+        .bind(execution_id)
+        .bind(owner_id)
+        .bind(lease.as_secs_f64())
+        .bind(ExecutionStatus::Running.as_ref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn claim_stdout_owner(
@@ -859,6 +1006,88 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    pub async fn terminal_execution_event_if_active_and_stdout_owner(
+        &self,
+        input: TerminalExecutionEventInput<'_>,
+    ) -> Result<Option<TerminalExecutionResult>, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set status = $2,
+                error = $3,
+                completed_at = coalesce(completed_at, now()),
+                stdout_owner_id = null,
+                stdout_owner_lease_expires_at = null,
+                updated_at = now()
+            where execution_id = $1
+              and status in ($4, $5)
+              and (($6::text is null and stdout_owner_id is null) or stdout_owner_id = $6)
+            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(input.execution_id)
+        .bind(input.status.as_ref())
+        .bind(input.error)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .bind(input.owner_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(
+            r#"
+            update sessions
+            set status = $2,
+                sandbox_id = case when $3::text is not null and sandbox_id = $3 then null else sandbox_id end,
+                updated_at = now()
+            where thread_key = $1
+            "#,
+        )
+        .bind(&row.thread_key)
+        .bind(input.session_status.as_ref())
+        .bind(input.clear_sandbox_id)
+        .execute(&mut *tx)
+        .await?;
+        let event_row = sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, $2, $3, $4)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(&row.thread_key)
+        .bind(input.execution_id)
+        .bind(input.event_type)
+        .bind(input.payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        if let Some(extra_event) = input.extra_event {
+            sqlx::query(
+                r#"
+                insert into session_events (thread_key, execution_id, event_type, payload)
+                values ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(&row.thread_key)
+            .bind(input.execution_id)
+            .bind(extra_event.event_type)
+            .bind(extra_event.payload)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(Some(TerminalExecutionResult {
+            execution: row.try_into()?,
+            event: event_row.try_into()?,
+        }))
+    }
+
     pub async fn append_event(
         &self,
         thread_key: &ThreadKey,
@@ -987,6 +1216,29 @@ impl PgSessionStore {
         .await?;
 
         Ok(exists)
+    }
+
+    pub async fn execution_event_id(
+        &self,
+        execution_id: &str,
+        event_type: &str,
+    ) -> Result<Option<i64>, SessionStoreError> {
+        let event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            select event_id
+            from session_events
+            where execution_id = $1
+              and event_type = $2
+            order by event_id
+            limit 1
+            "#,
+        )
+        .bind(execution_id)
+        .bind(event_type)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(event_id)
     }
 
     pub async fn list_referenced_sandbox_ids(&self) -> Result<Vec<String>, SessionStoreError> {
