@@ -112,4 +112,19 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     get pending_url
     assert_redirected_to console_principals_path
   end
+
+  test "the login session cookie is persistent with the historical key and configured lifetime" do
+    post login_url, params: { email: @operator.email, password: "password123456" }
+
+    set_cookie = Array(response.headers["Set-Cookie"]).join("\n")
+    assert_match(/_iron_control_session=/, set_cookie)
+    # A persistent (not browser-session) cookie: Rails emits the configured
+    # lifetime as an absolute Expires attribute. Without the session_store
+    # initializer this would be a session cookie with no Expires, and operators
+    # would be signed out on browser close.
+    expires = set_cookie[/expires=([^;]+)/i, 1]
+    assert expires, "session cookie should carry an Expires attribute, got: #{set_cookie}"
+    # Expires should land ~14 days out (the default), well beyond a short window.
+    assert_operator Time.httpdate(expires), :>, ConsoleSession::DEFAULT_MAX_AGE_SECONDS.seconds.from_now - 1.hour
+  end
 end
