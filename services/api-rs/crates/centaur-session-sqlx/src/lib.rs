@@ -1708,6 +1708,7 @@ impl PgSessionStore {
             set harness_thread_id = $2, updated_at = now()
             where thread_key = $1
             returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+
             "#,
         )
         .bind(thread_key.as_str())
@@ -1838,6 +1839,16 @@ pub enum SessionStoreError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     Migrate(#[from] sqlx::migrate::MigrateError),
+}
+
+impl SessionStoreError {
+    pub fn is_lock_timeout(&self) -> bool {
+        matches!(
+            self,
+            SessionStoreError::Sqlx(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("55P03")
+        )
+    }
 }
 
 #[derive(Debug, FromRow)]

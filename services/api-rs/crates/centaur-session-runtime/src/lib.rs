@@ -68,11 +68,18 @@ const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
 const SESSION_LIFECYCLE_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SESSION_LIFECYCLE_FENCE_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SESSION_LIFECYCLE_SANDBOX_OP_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const MAX_DURATION_FENCE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const MAX_DURATION_FENCE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 const INPUT_DELIVERY_CLAIM_LEASE: Duration = Duration::from_secs(300);
 /// A live execution can briefly have no sandbox while it moves from queued
 /// through warm-sandbox assignment. A periodic adoption scan must not fail a
@@ -5774,6 +5781,16 @@ async fn record_terminal_output(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaxDurationFailureOutcome {
+    Terminalized,
+    ExecutionChanged,
+}
+
+fn is_lifecycle_fence_timeout(error: &SessionRuntimeError) -> bool {
+    matches!(error, SessionRuntimeError::Store(store_error) if store_error.is_lock_timeout())
+}
+
 fn spawn_max_duration_failure(
     ctx: RuntimeContext,
     thread_key: ThreadKey,
@@ -5783,16 +5800,36 @@ fn spawn_max_duration_failure(
 ) {
     tokio::spawn(async move {
         sleep(max_duration).await;
-        if let Err(error) = record_max_duration_failure(
-            &ctx,
-            &thread_key,
-            &execution_id,
-            max_duration,
-            idle_timeout,
-        )
-        .await
-        {
-            warn!(%thread_key, %execution_id, %error, "max duration failure task failed");
+        loop {
+            match record_max_duration_failure(
+                &ctx,
+                &thread_key,
+                &execution_id,
+                max_duration,
+                idle_timeout,
+            )
+            .await
+            {
+                Ok(
+                    MaxDurationFailureOutcome::Terminalized
+                    | MaxDurationFailureOutcome::ExecutionChanged,
+                ) => {
+                    break;
+                }
+                Err(error) if is_lifecycle_fence_timeout(&error) => {
+                    warn!(
+                        %thread_key,
+                        %execution_id,
+                        %error,
+                        "max duration failure could not acquire lifecycle fence; retrying"
+                    );
+                    sleep(MAX_DURATION_FENCE_RETRY_BACKOFF).await;
+                }
+                Err(error) => {
+                    warn!(%thread_key, %execution_id, %error, "max duration failure task failed");
+                    break;
+                }
+            }
         }
     });
 }
@@ -5830,16 +5867,16 @@ async fn record_max_duration_failure(
     execution_id: &str,
     max_duration: Duration,
     idle_timeout: Option<Duration>,
-) -> Result<(), SessionRuntimeError> {
+) -> Result<MaxDurationFailureOutcome, SessionRuntimeError> {
     let _lifecycle_fence = ctx
         .store
         .acquire_session_lifecycle_fence(thread_key, SESSION_LIFECYCLE_FENCE_TIMEOUT)
         .await?;
     let Some(active_execution) = ctx.store.active_execution_for_thread(thread_key).await? else {
-        return Ok(());
+        return Ok(MaxDurationFailureOutcome::ExecutionChanged);
     };
     if active_execution.execution_id != execution_id {
-        return Ok(());
+        return Ok(MaxDurationFailureOutcome::ExecutionChanged);
     }
     let session = ctx.store.get_session(thread_key).await?;
     let sandbox_id = session.sandbox_id.clone();
@@ -5912,7 +5949,7 @@ async fn record_max_duration_failure(
         })
         .await?
     else {
-        return Ok(());
+        return Ok(MaxDurationFailureOutcome::ExecutionChanged);
     };
     let execution = terminal.execution;
     record_finished_execution_metric(
@@ -5934,7 +5971,7 @@ async fn record_max_duration_failure(
             idle_timeout,
         );
     }
-    Ok(())
+    Ok(MaxDurationFailureOutcome::Terminalized)
 }
 
 fn spawn_idle_pause(
@@ -9859,6 +9896,175 @@ mod adoption_tests {
             event.event_type == "session.sandbox_quarantined"
                 && event.payload["stop_result"] == json!("stop_timed_out")
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_duration_retries_lifecycle_fence_until_release() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "test:lifecycle-timeout-retry-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let sandbox_id = "sbx-timeout-retry-fence";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .unwrap();
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend);
+        let execution = store
+            .create_execution(&thread_key, Some("timeout-retry"), json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        store
+            .claim_stdout_owner(
+                &execution.execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = store
+            .acquire_session_lifecycle_fence(&thread_key, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        spawn_max_duration_failure(
+            runtime.context(),
+            thread_key.clone(),
+            execution.execution_id.clone(),
+            Duration::from_millis(1),
+            None,
+        );
+        sleep(SESSION_LIFECYCLE_FENCE_TIMEOUT + MAX_DURATION_FENCE_RETRY_BACKOFF * 2).await;
+        assert_eq!(
+            store
+                .execution(&execution.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+        drop(fence);
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        assert_eq!(
+            store.get_session(&thread_key).await.unwrap().sandbox_id,
+            None
+        );
+        let events = events(&store, &thread_key).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.sandbox_quarantined")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_duration_retry_exits_when_execution_changes() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "test:lifecycle-timeout-changed-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let sandbox_id = "sbx-timeout-changed";
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .unwrap();
+        store
+            .update_sandbox_id(&thread_key, Some(sandbox_id))
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend);
+        let old = store
+            .create_execution(&thread_key, Some("old-timeout"), json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&old.execution_id)
+            .await
+            .unwrap();
+        store
+            .claim_stdout_owner(
+                &old.execution_id,
+                &runtime.stdout_owner_id,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = store
+            .acquire_session_lifecycle_fence(&thread_key, Duration::from_secs(5))
+            .await
+            .unwrap();
+        spawn_max_duration_failure(
+            runtime.context(),
+            thread_key.clone(),
+            old.execution_id.clone(),
+            Duration::from_millis(1),
+            None,
+        );
+        sleep(SESSION_LIFECYCLE_FENCE_TIMEOUT + MAX_DURATION_FENCE_RETRY_BACKOFF * 2).await;
+        store
+            .fail_execution_if_active(&old.execution_id, "superseded")
+            .await
+            .unwrap();
+        let new = store
+            .create_execution(&thread_key, Some("new-timeout"), json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&new.execution_id)
+            .await
+            .unwrap();
+        drop(fence);
+        sleep(MAX_DURATION_FENCE_RETRY_BACKOFF * 3).await;
+
+        assert_eq!(
+            store
+                .execution(&new.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+        let old_events = store
+            .list_events_after(&thread_key, 0, Some(&old.execution_id), 100)
+            .await
+            .unwrap();
+        assert!(
+            old_events
+                .iter()
+                .all(|event| event.event_type != "session.sandbox_quarantined")
+        );
+        store
+            .fail_execution_if_active(&new.execution_id, "test cleanup")
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
