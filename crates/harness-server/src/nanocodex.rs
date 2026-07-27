@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -108,6 +109,49 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Name parts that nanocodex's shell tool treats as sensitive, removing the
+/// variable from every tool subprocess.
+///
+/// Mirrors `SENSITIVE_ENV_PARTS` in nanocodex-tools `shell/process.rs`, which is
+/// private. Keep the two in step: a part added there and missed here silently
+/// stops forwarding that variable, which is the exact failure this avoids.
+const SENSITIVE_ENV_PARTS: [&str; 11] = [
+    "AUTH",
+    "AUTHORIZATION",
+    "COOKIE",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "KEY",
+    "PASS",
+    "PASSWD",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+];
+
+fn is_sensitive_name(name: &OsStr) -> bool {
+    name.to_string_lossy()
+        .to_ascii_uppercase()
+        .split('_')
+        .any(|part| SENSITIVE_ENV_PARTS.contains(&part))
+}
+
+/// The sandbox credentials nanocodex's shell tool would otherwise strip from
+/// every tool subprocess.
+///
+/// Most of these values are not secrets: iron-proxy injects the real credential
+/// at the network boundary, so what the sandbox holds is a placeholder whose
+/// value is its own variable name, and a tool that cannot send it cannot
+/// authenticate at all — `git push` gets a 401 challenge it can never answer.
+/// Forwarding is the intended opt-in rather than a hole in the filter:
+/// nanocodex's own CLI forwards the mpp-egress proxy password the same way, and
+/// overrides still join the redaction list, so values stay masked in tool output.
+fn sandbox_tool_environment() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(name, _)| is_sensitive_name(name))
+        .collect()
+}
+
 fn build_agent(
     api_key: &str,
     cwd: &std::path::Path,
@@ -120,14 +164,18 @@ fn build_agent(
         .thinking(thinking)
         .workspace(cwd)
         .session_id(session_id);
+    // Built once so both tool paths below carry the forwarded environment.
+    let tools = Tools::builder()
+        .process_environment(sandbox_tool_environment())
+        .build()
+        .map_err(|error| nanocodex_error(error.into()))?;
     let result = if subagents {
         let tools_agents = Arc::downgrade(child_agents);
-        let tools = Tools::default();
         builder
             .tools_factory(move |agent| with_subagents(tools.clone(), agent, tools_agents.clone()))
             .build()
     } else {
-        builder.build()
+        builder.tools(tools).build()
     };
     result.map_err(nanocodex_error)
 }
@@ -623,5 +671,49 @@ mod tests {
             panic!("expected user prompt");
         };
         assert_eq!(thinking, Some(Thinking::High));
+    }
+
+    #[test]
+    fn sensitive_names_cover_the_sandbox_credentials() {
+        // The credentials api-rs puts in every sandbox, which tools cannot
+        // authenticate without.
+        for name in [
+            "GITHUB_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(
+                is_sensitive_name(OsStr::new(name)),
+                "{name} would not be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_names_exclude_the_normalized_shell_variables() {
+        // nanocodex normalizes these for child shells (TERM=dumb, PAGER=cat, ...)
+        // *before* applying overrides, so forwarding any of them would clobber
+        // the normalization and give tools a pager and colour output.
+        for name in [
+            "PATH",
+            "HOME",
+            "TERM",
+            "PAGER",
+            "GIT_PAGER",
+            "GH_PAGER",
+            "NO_COLOR",
+            "COLORTERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "CODEX_CI",
+        ] {
+            assert!(
+                !is_sensitive_name(OsStr::new(name)),
+                "{name} must not be forwarded"
+            );
+        }
     }
 }
