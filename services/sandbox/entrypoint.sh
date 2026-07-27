@@ -465,17 +465,31 @@ if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
     done
 fi
 
+# GitHub credentials have to be reachable from disk, not only from the
+# environment: a harness that scrubs sensitive-looking variables out of tool
+# subprocesses leaves the child with no credential at all otherwise. Nothing
+# here touches the network, so it completes before readiness rather than racing
+# a claim from a background job.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    git config --global credential.helper store
+    printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
+    chmod 600 "$HOME_DIR/.git-credentials"
+
+    # `gh auth login --with-token` cannot persist this: it refuses while
+    # GITHUB_TOKEN is set in the environment, exits non-zero, and writes nothing.
+    mkdir -p "$HOME_DIR/.config/gh"
+    printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n' "$GITHUB_TOKEN" \
+        > "$HOME_DIR/.config/gh/hosts.yml"
+    chmod 600 "$HOME_DIR/.config/gh/hosts.yml"
+
+    # Set the helper explicitly rather than via `gh auth setup-git`, which
+    # prepends an empty helper that resets the list, leaving the `store` helper
+    # above unreachable for github.com and gh as the only credential source.
+    git config --global --replace-all credential."https://github.com".helper store
+    git config --global --add credential."https://github.com".helper '!gh auth git-credential'
+fi
+
 # Signal readiness
 touch "$HOME_DIR/.ready"
-
-# ── Background: slow auth tasks ─────────────────────────────────────────────
-{
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        git config --global credential.helper store
-        printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
-        echo "${GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null || true
-        gh auth setup-git 2>/dev/null || true
-    fi
-} &
 
 exec "$@"
