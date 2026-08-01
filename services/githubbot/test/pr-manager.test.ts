@@ -488,6 +488,21 @@ describe("workflow event emission", () => {
     });
   });
 
+  test("lowercases correlation ids against repository full_name case drift", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits),
+      "check_run",
+      JSON.stringify({
+        action: "completed",
+        repository: { full_name: "Base/Repo" },
+        check_run: { head_sha: "ABC123", pull_requests: [{ number: 7 }] },
+      }),
+    );
+    expect(emits.length).toBe(1);
+    expect(emits[0]!.body.correlation_id).toBe("base/repo:abc123");
+  });
+
   test("emits ci-completed for a terminal legacy status", async () => {
     const emits: EmitCall[] = [];
     await handleCiEvent(
@@ -593,5 +608,24 @@ describe("workflow event emission", () => {
       }),
     );
     expect(emits.length).toBe(0);
+  });
+
+  test("honors a configured reviewer-bot list over the default", async () => {
+    const emits: EmitCall[] = [];
+    const codexReview = (id: number, login: string) =>
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: { id, state: "commented", user: { login } },
+      });
+    const ctx = emitCtx(emits, { workflowReviewBots: ["acme-review-bot"] });
+    await handleReviewEvent(ctx, codexReview(125, "chatgpt-codex-connector"));
+    await handleReviewEvent(ctx, codexReview(126, "acme-review-bot"));
+    expect(emits.length).toBe(1);
+    expect(emits[0]!.body).toMatchObject({
+      event_type: "codex-review",
+      correlation_id: "base/repo:pr-7:abc123",
+    });
   });
 });

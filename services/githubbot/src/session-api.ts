@@ -601,11 +601,10 @@ export type EmitWorkflowEventInput = {
 };
 
 /**
- * Fire a durable workflow event into api-rs (`POST /api/workflows/events`),
- * which resolves any `ctx.wait_for_event` waiters keyed on the same
- * (event_type, correlation_id). Best-effort by contract — it never throws: a
- * failed emission must not fail the webhook handler that produced it, and
- * waiters fall back to their timeout path on a missed event.
+ * Emit a durable workflow event (`POST /api/workflows/events`), resolving any
+ * `ctx.wait_for_event` waiters keyed on the same (event_type, correlation_id).
+ * Best-effort by contract — never throws: a failed emission must not fail the
+ * webhook handler, and waiters fall back to their timeout path on a miss.
  */
 export async function emitWorkflowEvent(
   options: GithubbotOptions,

@@ -39,10 +39,25 @@ const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
 
 // Durable-workflow event contract (consumed by workflow waiters via
 // ctx.wait_for_event). Correlation ids key on repo + head sha so a stale event
-// for an old push can never wake a waiter that has already moved on.
+// for an old push can never wake a waiter that has already moved on, and are
+// lowercased so case drift between a PR URL slug and repository.full_name can
+// never miss a waiter.
 export const WORKFLOW_EVENT_CI_COMPLETED = "ci-completed";
 export const WORKFLOW_EVENT_CODEX_REVIEW = "codex-review";
 const DEFAULT_WORKFLOW_REVIEW_BOTS = ["chatgpt-codex-connector"];
+
+function ciCorrelationId(owner: string, repo: string, headSha: string): string {
+  return `${owner}/${repo}:${headSha}`.toLowerCase();
+}
+
+function reviewCorrelationId(
+  owner: string,
+  repo: string,
+  number: number,
+  headSha: string,
+): string {
+  return `${owner}/${repo}:pr-${number}:${headSha}`.toLowerCase();
+}
 
 // CI conclusions that count as a hard, fixable failure (neutral/skipped/success
 // and the in-progress states are not failures).
@@ -423,14 +438,17 @@ export async function handleCiEvent(
   const target = ciTarget(eventType, payload);
   if (!target) return;
   // Workflow-event emission sits before any owned-PR gating (processCi owns()
-  // below): durable workflows wait on CI for PRs the bot does not own.
-  await maybeEmitCiCompleted(ctx, eventType, repo, payload, target.headSha);
+  // below): durable workflows wait on CI for PRs the bot does not own. The
+  // settled evaluation is shared so an owned PR isn't evaluated twice.
+  const evaluation = await maybeEmitCiCompleted(ctx, eventType, repo, payload, target.headSha);
   const prNumbers =
     target.prNumbers.length > 0
       ? target.prNumbers
       : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
   await Promise.all(
-    prNumbers.map((number) => processCi(ctx, repo.owner, repo.repo, number, target.headSha)),
+    prNumbers.map((number) =>
+      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation),
+    ),
   );
 }
 
@@ -441,7 +459,8 @@ export async function handleCiEvent(
  * event row while the rest of the suite is still running and strand waiters
  * on a premature wake. The aggregate payload can't see *required* checks, so
  * waiters still verify with one live read on wake — the event is the wake-up,
- * not the verdict.
+ * not the verdict. Returns the settled evaluation for the owned-PR path to
+ * reuse, or null when it wasn't computed.
  */
 async function maybeEmitCiCompleted(
   ctx: PrManagerContext,
@@ -449,16 +468,17 @@ async function maybeEmitCiCompleted(
   repo: { owner: string; repo: string },
   payload: JsonRecord,
   headSha: string,
-): Promise<void> {
-  if (ctx.options.workflowEvents !== true) return;
-  if (!ciCompletionSignaled(eventType, payload)) return;
+): Promise<CiEvaluation | null> {
+  if (ctx.options.workflowEvents !== true) return null;
+  if (!ciCompletionSignaled(eventType, payload)) return null;
   const evaluation = await fetchCiEvaluation(ctx, repo.owner, repo.repo, headSha);
-  if (!evaluation.settled) return;
+  if (!evaluation.settled) return null;
   await emitWorkflowEvent(ctx.options, {
     eventType: WORKFLOW_EVENT_CI_COMPLETED,
-    correlationId: `${repo.owner}/${repo.repo}:${headSha}`,
+    correlationId: ciCorrelationId(repo.owner, repo.repo, headSha),
     payload: { failed: evaluation.failed, failing: evaluation.failingNames },
   });
+  return evaluation;
 }
 
 /**
@@ -494,7 +514,7 @@ async function maybeEmitCodexReview(
   if (!bots.some((login) => login.toLowerCase() === target)) return;
   await emitWorkflowEvent(ctx.options, {
     eventType: WORKFLOW_EVENT_CODEX_REVIEW,
-    correlationId: `${repo.owner}/${repo.repo}:pr-${number}:${headSha}`,
+    correlationId: reviewCorrelationId(repo.owner, repo.repo, number, headSha),
     payload: { review_id: reviewId, state: reviewState ?? null },
   });
 }
@@ -506,13 +526,15 @@ async function processCi(
   number: number,
   headSha: string,
   force = false,
+  knownEvaluation?: CiEvaluation | null,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
   // Ignore CI for a SHA that's already been superseded by a newer push.
   if (pr.headSha !== headSha) return;
 
-  const evaluation = await fetchCiEvaluation(ctx, owner, repo, headSha);
+  const evaluation =
+    knownEvaluation ?? (await fetchCiEvaluation(ctx, owner, repo, headSha));
   if (!evaluation.settled) return; // wait until *all* checks are done.
   // Act once per fully-settled SHA (the last-arriving check event wins).
   if (
