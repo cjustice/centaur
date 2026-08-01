@@ -1,13 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   decideMerge,
-  evaluateCi,
   handleCiEvent,
   handleReviewEvent,
   isOwnedPr,
-  type CiCheck,
   type PrManagerContext,
 } from "../src/pr-manager";
+import { evaluateCi, type CiCheck } from "../src/workflow-events";
 
 function makeState() {
   const values = new Map<string, unknown>();
@@ -214,10 +213,14 @@ describe("PR management webhooks", () => {
     let mergeCalls = 0;
     const ctx = {
       octokit: {
-        rest: {
-          checks: {
-            listForRef: async () => ({ data: { check_runs: [] } }),
+        graphql: async () => ({
+          repository: {
+            object: {
+              statusCheckRollup: { state: "SUCCESS", contexts: { nodes: [] } },
+            },
           },
+        }),
+        rest: {
           pulls: {
             get: async () => ({
               data: prPayload({
@@ -231,9 +234,6 @@ describe("PR management webhooks", () => {
             },
           },
           repos: {
-            getCombinedStatusForRef: async () => ({
-              data: { statuses: [{ state: "success", context: "legacy-ci" }] },
-            }),
             listPullRequestsAssociatedWithCommit: async (input: {
               commit_sha: string;
             }) => {
@@ -340,18 +340,27 @@ describe("CI fix counter and escalation", () => {
   ): PrManagerContext {
     return {
       octokit: {
-        rest: {
-          checks: {
-            listForRef: async () => ({
-              data: {
-                check_runs: [
-                  { name: "build", status: "completed", conclusion: "failure" },
-                ],
+        graphql: async () => ({
+          repository: {
+            object: {
+              statusCheckRollup: {
+                state: "FAILURE",
+                contexts: {
+                  nodes: [
+                    {
+                      __typename: "CheckRun",
+                      name: "build",
+                      status: "COMPLETED",
+                      conclusion: "FAILURE",
+                    },
+                  ],
+                },
               },
-            }),
+            },
           },
+        }),
+        rest: {
           repos: {
-            getCombinedStatusForRef: async () => ({ data: { statuses: [] } }),
             getCommit: async () => ({
               data: { author: { login: "centaur-bot" } },
             }),
@@ -403,5 +412,250 @@ describe("CI fix counter and escalation", () => {
     expect(await state.get("centaur-githubbot:pr:base/repo#7")).toMatchObject({
       consecutiveCiFixes: 3,
     });
+  });
+});
+
+describe("workflow event emission", () => {
+  type EmitCall = {
+    url: string;
+    body: { event_type?: string; correlation_id?: string; payload?: unknown };
+  };
+
+  // The PR is deliberately NOT bot-owned (no assignees): workflow events must
+  // emit before the owned-PR gate, and the management path then no-ops, so no
+  // merge/turn mocks are needed.
+  type RollupStub = {
+    state?: string;
+    contexts?: Record<string, unknown>[];
+    fail?: boolean;
+  };
+
+  function emitCtx(
+    emits: EmitCall[],
+    options?: {
+      rollupSequence?: RollupStub[];
+      workflowEvents?: boolean;
+    },
+  ): PrManagerContext {
+    const sequence = [...(options?.rollupSequence ?? [{ state: "SUCCESS" }])];
+    return {
+      octokit: {
+        graphql: async () => {
+          const next = sequence.length > 1 ? sequence.shift()! : sequence[0]!;
+          if (next.fail) throw new Error("403 Forbidden");
+          return {
+            repository: {
+              object: {
+                statusCheckRollup: {
+                  state: next.state ?? "SUCCESS",
+                  contexts: { nodes: next.contexts ?? [] },
+                },
+              },
+            },
+          };
+        },
+        rest: {
+          repos: {
+            listPullRequestsAssociatedWithCommit: async () => ({ data: [] }),
+          },
+          pulls: {
+            get: async () => ({
+              data: prPayload({ assignees: [], headRepoFullName: "base/repo" }),
+            }),
+          },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        ciSettleConfirmMs: 0,
+        logger: quietLogger,
+        workflowEvents: options?.workflowEvents ?? true,
+        fetch: (url: RequestInfo | URL, init?: RequestInit) => {
+          emits.push({
+            url: String(url),
+            body: JSON.parse(String(init?.body ?? "{}")),
+          });
+          return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+        },
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+  }
+
+  const completedCheckRun = JSON.stringify({
+    action: "completed",
+    repository: { full_name: "base/repo" },
+    check_run: {
+      head_sha: "abc123",
+      name: "build",
+      conclusion: "success",
+      html_url: "https://example.test/checks/1",
+      pull_requests: [{ number: 7 }],
+    },
+  });
+
+  test("emits ci-completed for a completed check run before ownership gating", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(emitCtx(emits), "check_run", completedCheckRun);
+    expect(emits.length).toBe(1);
+    const emit = emits[0]!;
+    expect(emit.url).toBe("http://localhost/api/workflows/events");
+    expect(emit.body).toEqual({
+      event_type: "ci-completed",
+      correlation_id: "base/repo:abc123",
+      payload: { failed: false, failing: [] },
+    });
+  });
+
+  test("lowercases correlation ids against repository full_name case drift", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits),
+      "check_run",
+      JSON.stringify({
+        action: "completed",
+        repository: { full_name: "Base/Repo" },
+        check_run: { head_sha: "ABC123", pull_requests: [{ number: 7 }] },
+      }),
+    );
+    expect(emits.length).toBe(1);
+    expect(emits[0]!.body.correlation_id).toBe("base/repo:abc123");
+  });
+
+  test("emits ci-completed for a terminal legacy status", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits, {
+        rollupSequence: [
+          {
+            state: "FAILURE",
+            contexts: [
+              { __typename: "StatusContext", context: "deploy", state: "FAILURE" },
+            ],
+          },
+        ],
+      }),
+      "status",
+      JSON.stringify({
+        repository: { full_name: "base/repo" },
+        sha: "abc123",
+        state: "failure",
+        context: "deploy",
+        target_url: "https://example.test/deploy/1",
+      }),
+    );
+    expect(emits.length).toBe(1);
+    expect(emits[0]!.body).toEqual({
+      event_type: "ci-completed",
+      correlation_id: "base/repo:abc123",
+      payload: { failed: true, failing: ["deploy"] },
+    });
+  });
+
+  test("does not emit ci-completed while any check is still running", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits, { rollupSequence: [{ state: "PENDING" }] }),
+      "check_run",
+      completedCheckRun,
+    );
+    expect(emits.length).toBe(0);
+  });
+
+  test("does not emit on a momentary green — the registration race", async () => {
+    // Push lands, no-op checks complete first, the rollup reads SUCCESS for a
+    // few seconds before the real suite registers. The confirm re-read must
+    // catch it flipping PENDING and suppress the emission.
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits, { rollupSequence: [{ state: "SUCCESS" }, { state: "PENDING" }] }),
+      "check_run",
+      completedCheckRun,
+    );
+    expect(emits.length).toBe(0);
+  });
+
+  test("does not emit ci-completed when the rollup is unreadable", async () => {
+    // A failed read is UNKNOWN, not settled — emitting would manufacture a
+    // green signal out of thin air (e.g. a token missing checks:read).
+    const emits: EmitCall[] = [];
+    await handleCiEvent(emitCtx(emits, { rollupSequence: [{ fail: true }] }), "check_run", completedCheckRun);
+    expect(emits.length).toBe(0);
+  });
+
+  test("does not emit for an in-flight check run or a pending status", async () => {
+    const emits: EmitCall[] = [];
+    const ctx = emitCtx(emits);
+    await handleCiEvent(
+      ctx,
+      "check_run",
+      JSON.stringify({
+        action: "created",
+        repository: { full_name: "base/repo" },
+        check_run: { head_sha: "abc123", pull_requests: [] },
+      }),
+    );
+    await handleCiEvent(
+      ctx,
+      "status",
+      JSON.stringify({
+        repository: { full_name: "base/repo" },
+        sha: "abc123",
+        state: "pending",
+      }),
+    );
+    expect(emits.length).toBe(0);
+  });
+
+  test("does not emit when workflowEvents is off", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits, { workflowEvents: false }),
+      "check_run",
+      completedCheckRun,
+    );
+    expect(emits.length).toBe(0);
+  });
+
+  test("emits review-submitted keyed by PR, head sha, and reviewer", async () => {
+    const emits: EmitCall[] = [];
+    await handleReviewEvent(
+      emitCtx(emits),
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: {
+          id: 123,
+          state: "commented",
+          user: { login: "chatgpt-codex-connector" },
+        },
+      }),
+    );
+    expect(emits.length).toBe(1);
+    expect(emits[0]!.body).toEqual({
+      event_type: "review-submitted",
+      correlation_id: "base/repo:pr-7:abc123:chatgpt-codex-connector",
+      payload: { review_id: 123, state: "commented" },
+    });
+  });
+
+  test("reviews from different authors get independent rows, never collapsing", async () => {
+    const emits: EmitCall[] = [];
+    const submittedReview = (id: number, login: string) =>
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: { id, state: "commented", user: { login } },
+      });
+    const ctx = emitCtx(emits);
+    await handleReviewEvent(ctx, submittedReview(125, "human-reviewer"));
+    await handleReviewEvent(ctx, submittedReview(126, "chatgpt-codex-connector"));
+    expect(emits.map((e) => e.body.correlation_id)).toEqual([
+      "base/repo:pr-7:abc123:human-reviewer",
+      "base/repo:pr-7:abc123:chatgpt-codex-connector",
+    ]);
   });
 });
