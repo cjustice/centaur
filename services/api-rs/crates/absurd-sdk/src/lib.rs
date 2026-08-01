@@ -2440,4 +2440,109 @@ mod tests {
         drop(worker);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn integration_await_event_wait_emit_wake_timeout_when_database_url_is_set() -> Result<()>
+    {
+        let Some(pool) = optional_test_pool().await? else {
+            return Ok(());
+        };
+
+        let queue = unique_queue("rust_await_event");
+        let app = Client::from_pool_with_options(
+            pool,
+            ClientOptions {
+                queue_name: queue.clone(),
+                ..ClientOptions::default()
+            },
+        )?;
+        app.create_queue(None, Default::default()).await?;
+
+        // Emit BEFORE any waiter exists: the durable event row must resolve a
+        // later wait immediately (the runner can start waiting after CI finished).
+        app.emit_event("validation:early", json!({"conclusion": "success"}), None)
+            .await?;
+
+        app.register_task("waiter", |_params: Value, ctx| async move {
+            // Early emit resolves without sleeping.
+            let early = ctx
+                .await_event::<Value>("validation:early", AwaitEventOptions::default())
+                .await?;
+            // Live wait -> emit -> wake; a second await of the same event must
+            // return the checkpointed payload without another emit.
+            let got = ctx
+                .await_event::<Value>("validation:wake", AwaitEventOptions::default())
+                .await?;
+            let got_again = ctx
+                .await_event::<Value>("validation:wake", AwaitEventOptions::default())
+                .await?;
+            Ok(json!({"early": early, "got": got, "got_again": got_again}))
+        })?;
+
+        app.register_task("impatient", |_params: Value, ctx| async move {
+            // No emit inside the window: the timeout must surface as an error
+            // (the Python host raises it; the runner falls back to a poll).
+            let outcome = ctx
+                .await_event::<Value>(
+                    "validation:never",
+                    AwaitEventOptions {
+                        step_name: None,
+                        timeout: Some(Duration::from_millis(500)),
+                    },
+                )
+                .await;
+            Ok(match outcome {
+                Err(err) => json!({"error": err.to_string()}),
+                Ok(value) => json!({"error": Value::Null, "value": value}),
+            })
+        })?;
+
+        let spawned = app.spawn("waiter", json!({}), Default::default()).await?;
+        let timed = app
+            .spawn("impatient", json!({}), Default::default())
+            .await?;
+
+        let worker = app.start_worker(WorkerOptions {
+            worker_id: Some("rust-await-event-worker".to_string()),
+            concurrency: 2,
+            poll_interval: Duration::from_millis(25),
+            fatal_on_lease_timeout: false,
+            ..WorkerOptions::default()
+        });
+
+        // Let the worker reach the second wait, then emit.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        app.emit_event("validation:wake", json!({"review_id": 7}), None)
+            .await?;
+
+        let snapshot = app
+            .await_task_result(&spawned.task_id, None, Some(Duration::from_secs(10)))
+            .await?;
+        assert_eq!(
+            snapshot.result::<Value>()?,
+            Some(json!({
+                "early": {"conclusion": "success"},
+                "got": {"review_id": 7},
+                "got_again": {"review_id": 7},
+            }))
+        );
+
+        let timed_snapshot = app
+            .await_task_result(&timed.task_id, None, Some(Duration::from_secs(10)))
+            .await?;
+        let timed_error = timed_snapshot
+            .result::<Value>()?
+            .and_then(|v| v.get("error").cloned())
+            .and_then(|v| v.as_str().map(str::to_owned));
+        assert!(
+            timed_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out waiting for event"),
+            "expected timeout error, got {timed_snapshot:?}"
+        );
+
+        drop(worker);
+        Ok(())
+    }
 }
