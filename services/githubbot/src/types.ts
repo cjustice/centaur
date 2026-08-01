@@ -146,9 +146,10 @@ export type GithubbotOptions = {
   ciFixMaxAttempts?: number;
   /**
    * Emit durable workflow events (`POST /api/workflows/events` on api-rs) from
-   * lifecycle webhooks, before any owned-PR gating: `ci-completed` when a
-   * check_run/check_suite/workflow_run completes or a legacy status resolves,
-   * and `codex-review` when a configured reviewer bot submits a review.
+   * lifecycle webhooks, before any owned-PR gating: `ci-completed` once every
+   * check for a head sha has settled (durable events are immutable per
+   * correlation, so a single check's completion must never fire it), and
+   * `codex-review` when a configured reviewer bot submits a review.
    * Correlation ids key on repo + head sha so durable workflows can wait for
    * exactly the push they care about. Default false.
    */

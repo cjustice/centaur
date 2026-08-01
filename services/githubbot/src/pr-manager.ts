@@ -8,7 +8,6 @@ import type {
   GithubbotApiMessage,
   GithubbotOptions,
   GithubbotTrace,
-  JsonObject,
 } from "./types";
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
@@ -436,10 +435,13 @@ export async function handleCiEvent(
 }
 
 /**
- * Emit `ci-completed` for workflow waiters when a CI signal for a head sha
- * resolves (a check run/suite/workflow run completes, or a legacy status goes
- * terminal). The payload can't see *required* checks, so waiters still verify
- * with one live read on wake — this event is the wake-up, not the verdict.
+ * Emit `ci-completed` for workflow waiters once every check for a head sha has
+ * settled. Durable events are immutable — first write wins per correlation —
+ * so this must never fire on a single check's completion: that would lock the
+ * event row while the rest of the suite is still running and strand waiters
+ * on a premature wake. The aggregate payload can't see *required* checks, so
+ * waiters still verify with one live read on wake — the event is the wake-up,
+ * not the verdict.
  */
 async function maybeEmitCiCompleted(
   ctx: PrManagerContext,
@@ -449,38 +451,27 @@ async function maybeEmitCiCompleted(
   headSha: string,
 ): Promise<void> {
   if (ctx.options.workflowEvents !== true) return;
-  const detail = ciCompletionDetail(eventType, payload);
-  if (!detail) return;
+  if (!ciCompletionSignaled(eventType, payload)) return;
+  const evaluation = await fetchCiEvaluation(ctx, repo.owner, repo.repo, headSha);
+  if (!evaluation.settled) return;
   await emitWorkflowEvent(ctx.options, {
     eventType: WORKFLOW_EVENT_CI_COMPLETED,
     correlationId: `${repo.owner}/${repo.repo}:${headSha}`,
-    payload: detail,
+    payload: { failed: evaluation.failed, failing: evaluation.failingNames },
   });
 }
 
-function ciCompletionDetail(eventType: string, payload: JsonRecord): JsonObject | null {
+/**
+ * Cheap pre-filter before spending two GitHub API reads on the settled
+ * evaluation: only an event signaling something finished (a completed
+ * run/suite, or a terminal legacy status) can flip the aggregate to settled.
+ */
+function ciCompletionSignaled(eventType: string, payload: JsonRecord): boolean {
   if (eventType === "status") {
     const state = stringValue(payload.state);
-    if (!state || state === "pending") return null;
-    return {
-      conclusion: state,
-      name: stringValue(payload.context) ?? null,
-      html_url: stringValue(payload.target_url) ?? null,
-    };
+    return Boolean(state) && state !== "pending";
   }
-  if (stringValue(payload.action) !== "completed") return null;
-  const node =
-    eventType === "check_run"
-      ? payload.check_run
-      : eventType === "check_suite"
-        ? payload.check_suite
-        : payload.workflow_run;
-  if (!isRecord(node)) return null;
-  return {
-    conclusion: stringValue(node.conclusion) ?? null,
-    name: stringValue(node.name) ?? null,
-    html_url: stringValue(node.html_url) ?? null,
-  };
+  return stringValue(payload.action) === "completed";
 }
 
 /**

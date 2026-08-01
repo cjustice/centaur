@@ -417,14 +417,25 @@ describe("workflow event emission", () => {
   // merge/turn mocks are needed.
   function emitCtx(
     emits: EmitCall[],
-    options?: { workflowEvents?: boolean; workflowReviewBots?: string[] },
+    options?: {
+      checkRuns?: { status: string; conclusion: string | null; name: string }[];
+      statuses?: { state: string; context: string }[];
+      workflowEvents?: boolean;
+      workflowReviewBots?: string[];
+    },
   ): PrManagerContext {
     return {
       octokit: {
         rest: {
-          checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+          checks: {
+            listForRef: async () => ({
+              data: { check_runs: options?.checkRuns ?? [] },
+            }),
+          },
           repos: {
-            getCombinedStatusForRef: async () => ({ data: { statuses: [] } }),
+            getCombinedStatusForRef: async () => ({
+              data: { statuses: options?.statuses ?? [] },
+            }),
             listPullRequestsAssociatedWithCommit: async () => ({ data: [] }),
           },
           pulls: {
@@ -473,18 +484,14 @@ describe("workflow event emission", () => {
     expect(emit.body).toEqual({
       event_type: "ci-completed",
       correlation_id: "base/repo:abc123",
-      payload: {
-        conclusion: "success",
-        name: "build",
-        html_url: "https://example.test/checks/1",
-      },
+      payload: { failed: false, failing: [] },
     });
   });
 
   test("emits ci-completed for a terminal legacy status", async () => {
     const emits: EmitCall[] = [];
     await handleCiEvent(
-      emitCtx(emits),
+      emitCtx(emits, { statuses: [{ state: "failure", context: "deploy" }] }),
       "status",
       JSON.stringify({
         repository: { full_name: "base/repo" },
@@ -498,12 +505,23 @@ describe("workflow event emission", () => {
     expect(emits[0]!.body).toEqual({
       event_type: "ci-completed",
       correlation_id: "base/repo:abc123",
-      payload: {
-        conclusion: "failure",
-        name: "deploy",
-        html_url: "https://example.test/deploy/1",
-      },
+      payload: { failed: true, failing: ["deploy"] },
     });
+  });
+
+  test("does not emit ci-completed while any check is still running", async () => {
+    const emits: EmitCall[] = [];
+    await handleCiEvent(
+      emitCtx(emits, {
+        checkRuns: [
+          { name: "build", status: "completed", conclusion: "success" },
+          { name: "test", status: "in_progress", conclusion: null },
+        ],
+      }),
+      "check_run",
+      completedCheckRun,
+    );
+    expect(emits.length).toBe(0);
   });
 
   test("does not emit for an in-flight check run or a pending status", async () => {

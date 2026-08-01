@@ -155,7 +155,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
 | `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
-| `GITHUBBOT_WORKFLOW_EVENTS` | — | Emit durable workflow events to api-rs (`POST /api/workflows/events`) from lifecycle webhooks, before owned-PR gating: `ci-completed` (correlation `<owner>/<repo>:<head_sha>`) when a check run/suite/workflow run completes or a legacy status resolves, and `codex-review` (correlation `<owner>/<repo>:pr-<n>:<head_sha>`) when a configured reviewer bot submits. Default `false`. |
+| `GITHUBBOT_WORKFLOW_EVENTS` | — | Emit durable workflow events to api-rs (`POST /api/workflows/events`) from lifecycle webhooks, before owned-PR gating: `ci-completed` (correlation `<owner>/<repo>:<head_sha>`, payload `{failed, failing}`) once every check for the sha has settled — events are immutable per correlation, so a single check's completion never fires it — and `codex-review` (correlation `<owner>/<repo>:pr-<n>:<head_sha>`, payload `{review_id, state}`) when a configured reviewer bot submits. Default `false`. |
 | `GITHUBBOT_WORKFLOW_REVIEW_BOTS` | — | Comma-separated reviewer logins whose submitted reviews emit `codex-review`. Default `chatgpt-codex-connector`. |
 | `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
 | `GITHUBBOT_ESCALATION_HANDLE` | — | Fallback @handle (no leading @) tagged when the bot gives up. |
