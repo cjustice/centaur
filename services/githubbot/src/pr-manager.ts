@@ -1,12 +1,14 @@
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
+import { emitWorkflowEvent } from "./session-api";
 import { runTurnStream } from "./turn";
 import type {
   ForwardSessionInput,
   GithubbotApiMessage,
   GithubbotOptions,
   GithubbotTrace,
+  JsonObject,
 } from "./types";
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
@@ -35,6 +37,13 @@ export type PrManagerContext = {
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+
+// Durable-workflow event contract (consumed by workflow waiters via
+// ctx.wait_for_event). Correlation ids key on repo + head sha so a stale event
+// for an old push can never wake a waiter that has already moved on.
+export const WORKFLOW_EVENT_CI_COMPLETED = "ci-completed";
+export const WORKFLOW_EVENT_CODEX_REVIEW = "codex-review";
+const DEFAULT_WORKFLOW_REVIEW_BOTS = ["chatgpt-codex-connector"];
 
 // CI conclusions that count as a hard, fixable failure (neutral/skipped/success
 // and the in-progress states are not failures).
@@ -375,6 +384,11 @@ export async function handleReviewEvent(
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
+  // Workflow-event emission sits before the owned-PR gate: durable workflows
+  // wait on reviews for PRs the bot does not own.
+  if (pr) {
+    await maybeEmitCodexReview(ctx, repo, number, pr.headSha, reviewer, reviewState, reviewId);
+  }
   if (!pr || !owns(ctx, pr)) return;
   // Never act on the bot's own review (it shouldn't review its own PRs anyway).
   if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
@@ -409,6 +423,9 @@ export async function handleCiEvent(
   if (!repo) return;
   const target = ciTarget(eventType, payload);
   if (!target) return;
+  // Workflow-event emission sits before any owned-PR gating (processCi owns()
+  // below): durable workflows wait on CI for PRs the bot does not own.
+  await maybeEmitCiCompleted(ctx, eventType, repo, payload, target.headSha);
   const prNumbers =
     target.prNumbers.length > 0
       ? target.prNumbers
@@ -416,6 +433,79 @@ export async function handleCiEvent(
   await Promise.all(
     prNumbers.map((number) => processCi(ctx, repo.owner, repo.repo, number, target.headSha)),
   );
+}
+
+/**
+ * Emit `ci-completed` for workflow waiters when a CI signal for a head sha
+ * resolves (a check run/suite/workflow run completes, or a legacy status goes
+ * terminal). The payload can't see *required* checks, so waiters still verify
+ * with one live read on wake — this event is the wake-up, not the verdict.
+ */
+async function maybeEmitCiCompleted(
+  ctx: PrManagerContext,
+  eventType: string,
+  repo: { owner: string; repo: string },
+  payload: JsonRecord,
+  headSha: string,
+): Promise<void> {
+  if (ctx.options.workflowEvents !== true) return;
+  const detail = ciCompletionDetail(eventType, payload);
+  if (!detail) return;
+  await emitWorkflowEvent(ctx.options, {
+    eventType: WORKFLOW_EVENT_CI_COMPLETED,
+    correlationId: `${repo.owner}/${repo.repo}:${headSha}`,
+    payload: detail,
+  });
+}
+
+function ciCompletionDetail(eventType: string, payload: JsonRecord): JsonObject | null {
+  if (eventType === "status") {
+    const state = stringValue(payload.state);
+    if (!state || state === "pending") return null;
+    return {
+      conclusion: state,
+      name: stringValue(payload.context) ?? null,
+      html_url: stringValue(payload.target_url) ?? null,
+    };
+  }
+  if (stringValue(payload.action) !== "completed") return null;
+  const node =
+    eventType === "check_run"
+      ? payload.check_run
+      : eventType === "check_suite"
+        ? payload.check_suite
+        : payload.workflow_run;
+  if (!isRecord(node)) return null;
+  return {
+    conclusion: stringValue(node.conclusion) ?? null,
+    name: stringValue(node.name) ?? null,
+    html_url: stringValue(node.html_url) ?? null,
+  };
+}
+
+/**
+ * Emit `codex-review` when a configured reviewer bot submits a review on any
+ * PR (owned or not), keyed by head sha so a stale review on an old push never
+ * wakes a round that already pushed fixes.
+ */
+async function maybeEmitCodexReview(
+  ctx: PrManagerContext,
+  repo: { owner: string; repo: string },
+  number: number,
+  headSha: string,
+  reviewer: string | undefined,
+  reviewState: string | undefined,
+  reviewId: number,
+): Promise<void> {
+  if (ctx.options.workflowEvents !== true || !reviewer) return;
+  const bots = ctx.options.workflowReviewBots ?? DEFAULT_WORKFLOW_REVIEW_BOTS;
+  const target = reviewer.toLowerCase();
+  if (!bots.some((login) => login.toLowerCase() === target)) return;
+  await emitWorkflowEvent(ctx.options, {
+    eventType: WORKFLOW_EVENT_CODEX_REVIEW,
+    correlationId: `${repo.owner}/${repo.repo}:pr-${number}:${headSha}`,
+    payload: { review_id: reviewId, state: reviewState ?? null },
+  });
 }
 
 async function processCi(

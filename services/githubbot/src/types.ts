@@ -144,6 +144,20 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
+  /**
+   * Emit durable workflow events (`POST /api/workflows/events` on api-rs) from
+   * lifecycle webhooks, before any owned-PR gating: `ci-completed` when a
+   * check_run/check_suite/workflow_run completes or a legacy status resolves,
+   * and `codex-review` when a configured reviewer bot submits a review.
+   * Correlation ids key on repo + head sha so durable workflows can wait for
+   * exactly the push they care about. Default false.
+   */
+  workflowEvents?: boolean;
+  /**
+   * Reviewer logins whose submitted reviews emit `codex-review` workflow
+   * events (case-insensitive). Default ["chatgpt-codex-connector"].
+   */
+  workflowReviewBots?: string[];
   /** Delete the head branch after the bot merges an owned PR. Default true. */
   deleteBranchOnMerge?: boolean;
   /** Fallback @handle to tag when the bot gives up and escalates. */

@@ -16,6 +16,7 @@ import type {
 } from "./types";
 import {
   elapsedMs,
+  errorMessage,
   isJsonObject,
   noopLogger,
   nowMs,
@@ -591,6 +592,55 @@ async function streamSessionNotifications(
   await ensureApiOk(response, "stream events", options);
   if (!response.body) return toAsyncIterable([]);
   return parseSessionEventStream(response.body, onEventId);
+}
+
+export type EmitWorkflowEventInput = {
+  eventType: string;
+  correlationId: string;
+  payload: JsonObject;
+};
+
+/**
+ * Fire a durable workflow event into api-rs (`POST /api/workflows/events`),
+ * which resolves any `ctx.wait_for_event` waiters keyed on the same
+ * (event_type, correlation_id). Best-effort by contract — it never throws: a
+ * failed emission must not fail the webhook handler that produced it, and
+ * waiters fall back to their timeout path on a missed event.
+ */
+export async function emitWorkflowEvent(
+  options: GithubbotOptions,
+  input: EmitWorkflowEventInput,
+): Promise<void> {
+  const url = new URL(
+    "/api/workflows/events",
+    ensureTrailingSlash(options.apiUrl),
+  ).toString();
+  try {
+    const fetchFn = options.fetch ?? fetch;
+    const response = await fetchFn(url, {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify({
+        event_type: input.eventType,
+        correlation_id: input.correlationId,
+        payload: input.payload,
+      }),
+    });
+    if (!response.ok) {
+      (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
+        correlation_id: input.correlationId,
+        event_type: input.eventType,
+        status: response.status,
+        status_text: response.statusText,
+      });
+    }
+  } catch (error) {
+    (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
+      correlation_id: input.correlationId,
+      error: errorMessage(error),
+      event_type: input.eventType,
+    });
+  }
 }
 
 function apiSessionUrl(
