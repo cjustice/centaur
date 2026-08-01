@@ -149,13 +149,13 @@ export type GithubbotOptions = {
    * lifecycle webhooks, before any owned-PR gating: `ci-completed` once every
    * check for a head sha has settled (durable events are immutable per
    * correlation, so a single check's completion must never fire it), and
-   * `codex-review` when a configured reviewer bot submits a review.
+   * `review-submitted` when a configured reviewer bot submits a review.
    * Correlation ids key on repo + head sha so durable workflows can wait for
    * exactly the push they care about. Default false.
    */
   workflowEvents?: boolean;
   /**
-   * Reviewer logins whose submitted reviews emit `codex-review` workflow
+   * Reviewer logins whose submitted reviews emit `review-submitted` workflow
    * events (case-insensitive). Default ["chatgpt-codex-connector"].
    */
   workflowReviewBots?: string[];

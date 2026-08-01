@@ -43,7 +43,7 @@ const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
 // lowercased so case drift between a PR URL slug and repository.full_name can
 // never miss a waiter.
 export const WORKFLOW_EVENT_CI_COMPLETED = "ci-completed";
-export const WORKFLOW_EVENT_CODEX_REVIEW = "codex-review";
+export const WORKFLOW_EVENT_REVIEW_SUBMITTED = "review-submitted";
 const DEFAULT_WORKFLOW_REVIEW_BOTS = ["chatgpt-codex-connector"];
 
 function ciCorrelationId(owner: string, repo: string, headSha: string): string {
@@ -401,7 +401,7 @@ export async function handleReviewEvent(
   // Workflow-event emission sits before the owned-PR gate: durable workflows
   // wait on reviews for PRs the bot does not own.
   if (pr) {
-    await maybeEmitCodexReview(ctx, repo, number, pr.headSha, reviewer, reviewState, reviewId);
+    await maybeEmitReviewSubmitted(ctx, repo, number, pr.headSha, reviewer, reviewState, reviewId);
   }
   if (!pr || !owns(ctx, pr)) return;
   // Never act on the bot's own review (it shouldn't review its own PRs anyway).
@@ -495,11 +495,11 @@ function ciCompletionSignaled(eventType: string, payload: JsonRecord): boolean {
 }
 
 /**
- * Emit `codex-review` when a configured reviewer bot submits a review on any
- * PR (owned or not), keyed by head sha so a stale review on an old push never
- * wakes a round that already pushed fixes.
+ * Emit `review-submitted` when a configured reviewer bot submits a review on
+ * any PR (owned or not), keyed by head sha so a stale review on an old push
+ * never wakes a round that already pushed fixes.
  */
-async function maybeEmitCodexReview(
+async function maybeEmitReviewSubmitted(
   ctx: PrManagerContext,
   repo: { owner: string; repo: string },
   number: number,
@@ -513,7 +513,7 @@ async function maybeEmitCodexReview(
   const target = reviewer.toLowerCase();
   if (!bots.some((login) => login.toLowerCase() === target)) return;
   await emitWorkflowEvent(ctx.options, {
-    eventType: WORKFLOW_EVENT_CODEX_REVIEW,
+    eventType: WORKFLOW_EVENT_REVIEW_SUBMITTED,
     correlationId: reviewCorrelationId(repo.owner, repo.repo, number, headSha),
     payload: { review_id: reviewId, state: reviewState ?? null },
   });

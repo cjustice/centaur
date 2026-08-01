@@ -573,7 +573,7 @@ describe("workflow event emission", () => {
     expect(emits.length).toBe(0);
   });
 
-  test("emits codex-review keyed by PR and head sha for a configured reviewer bot", async () => {
+  test("emits review-submitted keyed by PR and head sha for a configured reviewer bot", async () => {
     const emits: EmitCall[] = [];
     await handleReviewEvent(
       emitCtx(emits),
@@ -590,13 +590,13 @@ describe("workflow event emission", () => {
     );
     expect(emits.length).toBe(1);
     expect(emits[0]!.body).toEqual({
-      event_type: "codex-review",
+      event_type: "review-submitted",
       correlation_id: "base/repo:pr-7:abc123",
       payload: { review_id: 123, state: "commented" },
     });
   });
 
-  test("does not emit codex-review for other reviewers", async () => {
+  test("does not emit review-submitted for other reviewers", async () => {
     const emits: EmitCall[] = [];
     await handleReviewEvent(
       emitCtx(emits),
@@ -612,7 +612,7 @@ describe("workflow event emission", () => {
 
   test("honors a configured reviewer-bot list over the default", async () => {
     const emits: EmitCall[] = [];
-    const codexReview = (id: number, login: string) =>
+    const submittedReview = (id: number, login: string) =>
       JSON.stringify({
         action: "submitted",
         repository: { full_name: "base/repo" },
@@ -620,11 +620,11 @@ describe("workflow event emission", () => {
         review: { id, state: "commented", user: { login } },
       });
     const ctx = emitCtx(emits, { workflowReviewBots: ["acme-review-bot"] });
-    await handleReviewEvent(ctx, codexReview(125, "chatgpt-codex-connector"));
-    await handleReviewEvent(ctx, codexReview(126, "acme-review-bot"));
+    await handleReviewEvent(ctx, submittedReview(125, "chatgpt-codex-connector"));
+    await handleReviewEvent(ctx, submittedReview(126, "acme-review-bot"));
     expect(emits.length).toBe(1);
     expect(emits[0]!.body).toMatchObject({
-      event_type: "codex-review",
+      event_type: "review-submitted",
       correlation_id: "base/repo:pr-7:abc123",
     });
   });
