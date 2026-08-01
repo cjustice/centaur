@@ -554,6 +554,12 @@ githubbot:
   # / draft status.
   autoMerge: true
   mergeMethod: squash
+  # Durable-workflow event emission: when true, lifecycle webhooks also POST
+  # ci-completed / review-submitted events to api-rs (/api/workflows/events) so
+  # durable workflows can wait on CI/review for ANY PR (not just bot-owned
+  # ones), keyed by head sha. The api-rs URL and service token are already
+  # wired; this only flips the behavior on.
+  workflowEvents: false
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
   # Optional review / issue-work methodology overrides. When set, the chart writes

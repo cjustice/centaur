@@ -98,6 +98,9 @@ spec:
               value: {{ .Values.githubbot.autoMerge | quote }}
             - name: GITHUBBOT_MERGE_METHOD
               value: {{ .Values.githubbot.mergeMethod | quote }}
+            # Durable workflow-event emission (ci-completed / review-submitted) to api-rs.
+            - name: GITHUBBOT_WORKFLOW_EVENTS
+              value: {{ .Values.githubbot.workflowEvents | quote }}
 {{- if .Values.githubbot.escalationHandle }}
             - name: GITHUBBOT_ESCALATION_HANDLE
               value: {{ .Values.githubbot.escalationHandle | quote }}
