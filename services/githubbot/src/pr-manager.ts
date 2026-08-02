@@ -4,8 +4,8 @@ import { backgroundWaitUntil } from "./context";
 import { runTurnStream } from "./turn";
 import {
   fetchCiEvaluation,
-  maybeEmitCiCompleted,
   maybeEmitReviewSubmitted,
+  prepareCiCompleted,
   type CiEvaluation,
 } from "./workflow-events";
 import type {
@@ -330,12 +330,27 @@ export async function handleReviewEvent(
   const reviewer = stringValue(isRecord(reviewNode.user) ? reviewNode.user.login : undefined);
   const reviewState = stringValue(reviewNode.state)?.toLowerCase();
 
-  const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
-  // Workflow-event emission sits before the owned-PR gate: durable workflows
-  // wait on reviews for PRs the bot does not own.
-  if (pr) {
-    await maybeEmitReviewSubmitted(ctx, repo, number, pr.headSha, reviewer, reviewState, reviewId);
+  // A review is tied to review.commit_id. The PR head can advance before this
+  // webhook is handled, so a live PR lookup would correlate the review to the
+  // wrong push.
+  const reviewedHeadSha =
+    stringValue(reviewNode.commit_id) ??
+    stringValue(isRecord(prNode.head) ? prNode.head.sha : undefined);
+  if (reviewedHeadSha) {
+    backgroundWaitUntil(
+      maybeEmitReviewSubmitted(
+        ctx,
+        repo,
+        number,
+        reviewedHeadSha,
+        reviewer,
+        reviewState,
+        reviewId,
+      ),
+    );
   }
+
+  const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
   // Never act on the bot's own review (it shouldn't review its own PRs anyway).
   if (reviewer && reviewer.toLowerCase() === ctx.userName.toLowerCase()) return;
@@ -370,10 +385,17 @@ export async function handleCiEvent(
   if (!repo) return;
   const target = ciTarget(eventType, payload);
   if (!target) return;
-  // Workflow-event emission sits before any owned-PR gating (processCi owns()
-  // below): durable workflows wait on CI for PRs the bot does not own. The
-  // settled evaluation is shared so an owned PR isn't evaluated twice.
-  const evaluation = await maybeEmitCiCompleted(ctx, eventType, repo, payload, target.headSha);
+  // The initial rollup read is shared with owned-PR management. Green
+  // confirmation and event delivery continue in the background so they never
+  // hold up CI fixes or merges.
+  const { emission, evaluation } = await prepareCiCompleted(
+    ctx,
+    eventType,
+    repo,
+    payload,
+    target.headSha,
+  );
+  if (emission) backgroundWaitUntil(emission);
   const prNumbers =
     target.prNumbers.length > 0
       ? target.prNumbers

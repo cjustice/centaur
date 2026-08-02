@@ -4,44 +4,15 @@ import type { GithubbotOptions } from "./types";
 import { errorMessage, noopLogger, stringValue } from "./utils";
 
 /**
- * GitHub → durable-workflow-event producer.
- *
- * Lifecycle webhooks (check_run / check_suite / workflow_run / status /
- * pull_request_review) are translated into curated durable events on api-rs
- * (`POST /api/workflows/events`) that workflows suspend on via
- * `ctx.wait_for_event`. This module is deliberately independent of the
- * owned-PR manager in pr-manager.ts: it runs before any ownership gating,
- * because workflow waiters are not bot-owned PRs. The manager reuses this
- * module's settled-CI evaluation for its own gate so an owned PR is never
- * evaluated twice for the same webhook.
- *
- * Two curation rules, both forced by the engine — durable events are
- * immutable per (event_type, correlation_id); first write wins:
- *
- * 1. An event must be SEMANTICALLY COMPLETE when emitted. There is no
- *    re-emit, so firing early (one check completing while the rest of the
- *    suite runs) locks the correlation with a premature payload forever.
- *    `ci-completed` therefore fires only once every check for the sha has
- *    settled.
- * 2. Anything a waiter would filter on must be part of the correlation.
- *    await_event matches on the correlation alone and the first write wins,
- *    so a property that distinguishes signals (WHO reviewed) must be a
- *    correlation segment — otherwise one occurrence consumes the key and the
- *    occurrence the waiter wanted can never land. Waiters therefore key on
- *    exactly the discriminator they care about (e.g. one reviewer's login).
- *
- * Correlations are computable from data a waiter already has — the repo
- * slug, the head sha, the PR number, the author's login — and are
- * lowercased so case drift between a PR URL slug and repository.full_name
- * can never miss:
+ * Converts GitHub lifecycle webhooks into api-rs workflow events. Events are
+ * immutable per (event_type, correlation_id), so CI emits only after every
+ * check settles and each correlation includes every waiter discriminator.
  *
  *   commit-scoped: <owner>/<repo>:<head_sha>
  *   PR-scoped:     <owner>/<repo>:pr-<n>:<head_sha>:<actor>
  *
- * <actor> is the author's login verbatim from the webhook (lowercased) —
- * GitHub App reviewers carry their canonical `[bot]`-suffixed login
- * (`chatgpt-codex-connector[bot]`), so waiter configs must name the exact
- * login. New events should follow both rules and this convention.
+ * Correlations are lowercased. GitHub App actors retain the `[bot]` suffix,
+ * so waiter configs must use the exact login.
  */
 
 type Octokit = GitHubAdapter["octokit"];
@@ -82,8 +53,24 @@ const FAILED_CONCLUSIONS = new Set([
   "cancelled",
   "failure",
   "stale",
+  "startup_failure",
   "timed_out",
 ]);
+
+const SETTLED_CHECK_STATES = new Set([
+  "ACTION_REQUIRED",
+  "CANCELLED",
+  "COMPLETED",
+  "FAILURE",
+  "NEUTRAL",
+  "SKIPPED",
+  "STALE",
+  "STARTUP_FAILURE",
+  "SUCCESS",
+  "TIMED_OUT",
+]);
+
+const SETTLED_STATUS_STATES = new Set(["ERROR", "FAILURE", "SUCCESS"]);
 
 export type CiCheck = { status: string; conclusion: string | null; name: string };
 export type CiStatus = { state: string; context: string };
@@ -104,7 +91,9 @@ export function evaluateCi(
   statuses: CiStatus[],
 ): CiEvaluation {
   const anyCheckPending = checks.some((c) => c.status !== "completed");
-  const anyStatusPending = statuses.some((s) => s.state === "pending");
+  const anyStatusPending = statuses.some(
+    (s) => s.state !== "success" && s.state !== "failure" && s.state !== "error",
+  );
   const failingChecks = checks.filter(
     (c) =>
       c.status === "completed" &&
@@ -130,18 +119,33 @@ export function evaluateCi(
 // including EXPECTED — a required check that hasn't reported yet, which no
 // list merge can see. The REST check-runs list is also unreadable by
 // fine-grained PATs (403), while the rollup state is not.
-const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectID!) {
+const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectID!, $after: String) {
   repository(owner: $owner, name: $repo) {
     object(oid: $sha) {
       ... on Commit {
         statusCheckRollup {
           state
-          contexts(first: 100) {
+          contexts(first: 100, after: $after) {
             nodes {
               __typename
-              ... on CheckRun { name status conclusion }
-              ... on StatusContext { context state }
+              ... on CheckRun {
+                name
+                status
+                conclusion
+                startedAt
+                checkSuite {
+                  app { slug }
+                  workflowRun {
+                    event
+                    workflow { name }
+                  }
+                }
+              }
+              ... on StatusContext { context state createdAt }
             }
+            pageInfo { hasNextPage endCursor }
+            checkRunCountsByState { state count }
+            statusContextCountsByState { state count }
           }
         }
       }
@@ -151,16 +155,43 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
 
 type CiRollupContext = {
   __typename: string;
+  checkSuite?: {
+    app?: { slug?: string | null } | null;
+    workflowRun?: {
+      event?: string | null;
+      workflow?: { name?: string | null } | null;
+    } | null;
+  } | null;
+  createdAt?: string | null;
   name?: string;
   status?: string;
   conclusion?: string | null;
   context?: string;
   state?: string;
+  startedAt?: string | null;
+};
+
+type CiRollupCheck = CiRollupContext & { name: string; status: string };
+type CiRollupStatus = CiRollupContext & { context: string; state: string };
+
+type CiStateCount = {
+  count: number;
+  state: string;
+};
+
+type CiPageInfo = {
+  endCursor?: string | null;
+  hasNextPage: boolean;
 };
 
 type CiRollup = {
   state: string;
-  contexts?: { nodes?: (CiRollupContext | null)[] | null } | null;
+  contexts?: {
+    nodes?: (CiRollupContext | null)[] | null;
+    pageInfo?: CiPageInfo | null;
+    checkRunCountsByState?: CiStateCount[] | null;
+    statusContextCountsByState?: CiStateCount[] | null;
+  } | null;
 };
 
 type CiRollupResponse = {
@@ -186,49 +217,128 @@ export async function fetchCiEvaluation(
   sha: string,
 ): Promise<CiEvaluation | null> {
   const logger = ctx.options.logger ?? noopLogger;
-  let rollup: CiRollup | null | undefined;
-  try {
-    const result = await ctx.octokit.graphql<CiRollupResponse>(CI_ROLLUP_QUERY, {
-      owner,
-      repo,
-      sha,
-    });
-    rollup = result.repository?.object?.statusCheckRollup;
-  } catch (error) {
-    // octokit throws on ANY GraphQL errors, including the partial-data
-    // FORBIDDEN on context nodes — salvage the rollup state when it came back.
-    const partial = (error as { data?: CiRollupResponse }).data;
-    rollup = partial?.repository?.object?.statusCheckRollup;
-    if (!rollup) {
-      logger.warn("githubbot_ci_rollup_failed", { error: errorMessage(error) });
+  const nodes: CiRollupContext[] = [];
+  let after: string | null = null;
+  let rollupState: string | undefined;
+  let checkRunCounts: CiStateCount[] | null | undefined;
+  let statusContextCounts: CiStateCount[] | null | undefined;
+  let detailReadable = true;
+
+  for (;;) {
+    let rollup: CiRollup | null | undefined;
+    try {
+      const result: CiRollupResponse = await ctx.octokit.graphql<CiRollupResponse>(
+        CI_ROLLUP_QUERY,
+        { after, owner, repo, sha },
+      );
+      rollup = result.repository?.object?.statusCheckRollup;
+    } catch (error) {
+      const partial = (error as { data?: CiRollupResponse }).data;
+      rollup = partial?.repository?.object?.statusCheckRollup;
+      if (!rollup) {
+        logger.warn("githubbot_ci_rollup_failed", { error: errorMessage(error) });
+        return null;
+      }
+    }
+    if (!rollup) return null;
+
+    rollupState = rollup.state;
+    checkRunCounts ??= rollup.contexts?.checkRunCountsByState;
+    statusContextCounts ??= rollup.contexts?.statusContextCountsByState;
+    const pageNodes = rollup.contexts?.nodes;
+    const readableNodes = pageNodes?.filter(
+      (node): node is CiRollupContext => node !== null,
+    );
+    if (!pageNodes || readableNodes?.length !== pageNodes.length) {
+      detailReadable = false;
+    } else {
+      nodes.push(...readableNodes);
+    }
+
+    const pageInfo: CiPageInfo | null | undefined = rollup.contexts?.pageInfo;
+    if (!detailReadable || !pageInfo?.hasNextPage) break;
+    if (!pageInfo.endCursor) {
+      logger.warn("githubbot_ci_rollup_pagination_failed", { ref: `${owner}/${repo}@${sha}` });
       return null;
     }
+    after = pageInfo.endCursor;
   }
-  if (!rollup) return null;
-  if (rollup.state === "PENDING" || rollup.state === "EXPECTED") {
-    return { settled: false, failed: false, failingNames: [] };
-  }
-  const checks: CiCheck[] = [];
-  const statuses: CiStatus[] = [];
-  for (const node of rollup.contexts?.nodes ?? []) {
-    if (!node) continue;
-    if (node.__typename === "CheckRun" && node.name && node.status) {
-      checks.push({
-        status: node.status.toLowerCase(),
-        conclusion: node.conclusion?.toLowerCase() ?? null,
-        name: node.name,
-      });
-    } else if (node.__typename === "StatusContext" && node.context && node.state) {
-      statuses.push({ state: node.state.toLowerCase(), context: node.context });
+
+  if (!rollupState) return null;
+  const detail = detailReadable ? evaluateCiRollupContexts(nodes) : null;
+  const aggregatePending = rollupState === "PENDING" || rollupState === "EXPECTED";
+  const countsPending = stateCountsPending(checkRunCounts, statusContextCounts);
+  const settled = detail
+    ? detail.settled && !aggregatePending
+    : countsPending === undefined
+      ? rollupState === "SUCCESS"
+      : !aggregatePending && !countsPending;
+  return {
+    settled,
+    failed:
+      rollupState === "FAILURE" || rollupState === "ERROR" || detail?.failed === true,
+    failingNames: detail?.failingNames ?? [],
+  };
+}
+
+function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
+  const checks = latestCiChecks(nodes).map((node) => ({
+    status: node.status.toLowerCase(),
+    conclusion: node.conclusion?.toLowerCase() ?? null,
+    name: node.name,
+  }));
+  const statuses = latestCiStatuses(nodes).map((node) => ({
+    state: node.state.toLowerCase(),
+    context: node.context,
+  }));
+  return evaluateCi(checks, statuses);
+}
+
+function latestCiChecks(nodes: CiRollupContext[]): CiRollupCheck[] {
+  const latest = new Map<string, CiRollupCheck>();
+  for (const node of nodes) {
+    if (node.__typename !== "CheckRun" || !node.name || !node.status) continue;
+    const check: CiRollupCheck = { ...node, name: node.name, status: node.status };
+    const workflowRun = node.checkSuite?.workflowRun;
+    const key = [
+      node.checkSuite?.app?.slug ?? "",
+      node.name,
+      workflowRun?.workflow?.name ?? "",
+      workflowRun?.event ?? "",
+    ].join("\0");
+    const current = latest.get(key);
+    if (!current || (node.startedAt ?? "") >= (current.startedAt ?? "")) {
+      latest.set(key, check);
     }
   }
-  const detail = evaluateCi(checks, statuses);
-  return {
-    settled: true,
-    failed:
-      rollup.state === "FAILURE" || rollup.state === "ERROR" || detail.failed,
-    failingNames: detail.failingNames,
-  };
+  return [...latest.values()];
+}
+
+function latestCiStatuses(nodes: CiRollupContext[]): CiRollupStatus[] {
+  const latest = new Map<string, CiRollupStatus>();
+  for (const node of nodes) {
+    if (node.__typename !== "StatusContext" || !node.context || !node.state) continue;
+    const current = latest.get(node.context);
+    if (!current || (node.createdAt ?? "") >= (current.createdAt ?? "")) {
+      latest.set(node.context, {
+        ...node,
+        context: node.context,
+        state: node.state,
+      });
+    }
+  }
+  return [...latest.values()];
+}
+
+function stateCountsPending(
+  checkRunCounts: CiStateCount[] | null | undefined,
+  statusContextCounts: CiStateCount[] | null | undefined,
+): boolean | undefined {
+  if (!checkRunCounts || !statusContextCounts) return undefined;
+  return (
+    checkRunCounts.some(({ count, state }) => count > 0 && !SETTLED_CHECK_STATES.has(state)) ||
+    statusContextCounts.some(({ count, state }) => count > 0 && !SETTLED_STATUS_STATES.has(state))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,31 +359,48 @@ const DEFAULT_CI_SETTLE_CONFIRM_MS = 15_000;
  * and a green rollup is confirmed with a delayed second read against the
  * registration race. The aggregate payload can't see *required* checks, so
  * waiters still verify with one live read on wake: the event is the wake-up,
- * not the verdict. Returns the settled evaluation for the owned-PR path to
- * reuse, or null when it wasn't computed.
+ * not the verdict. The initial evaluation is returned for the owned-PR path;
+ * confirmation and delivery run in the returned promise so they do not delay
+ * PR management.
  */
-export async function maybeEmitCiCompleted(
+export async function prepareCiCompleted(
   ctx: WorkflowEventProducerContext,
   eventType: string,
   repo: { owner: string; repo: string },
   payload: JsonRecord,
   headSha: string,
-): Promise<CiEvaluation | null> {
-  if (ctx.options.workflowEvents !== true) return null;
-  if (!ciCompletionSignaled(eventType, payload)) return null;
+): Promise<{
+  emission: Promise<void> | null;
+  evaluation: CiEvaluation | null;
+}> {
+  if (ctx.options.workflowEvents !== true || !ciCompletionSignaled(eventType, payload)) {
+    return { emission: null, evaluation: null };
+  }
   const evaluation = await fetchCiEvaluation(ctx, repo.owner, repo.repo, headSha);
-  if (!evaluation?.settled) return null;
+  if (!evaluation?.settled) return { emission: null, evaluation };
+
+  return {
+    evaluation,
+    emission: emitCiCompleted(ctx, repo, headSha, evaluation),
+  };
+}
+
+async function emitCiCompleted(
+  ctx: WorkflowEventProducerContext,
+  repo: { owner: string; repo: string },
+  headSha: string,
+  evaluation: CiEvaluation,
+): Promise<void> {
   if (!evaluation.failed) {
     await sleep(ctx.options.ciSettleConfirmMs ?? DEFAULT_CI_SETTLE_CONFIRM_MS);
     const confirmed = await fetchCiEvaluation(ctx, repo.owner, repo.repo, headSha);
-    if (!confirmed?.settled || confirmed.failed) return null;
+    if (!confirmed?.settled || confirmed.failed) return;
   }
   await emitWorkflowEvent(ctx.options, {
     eventType: WORKFLOW_EVENT_CI_COMPLETED,
     correlationId: ciCorrelationId(repo.owner, repo.repo, headSha),
     payload: { failed: evaluation.failed, failing: evaluation.failingNames },
   });
-  return evaluation;
 }
 
 function sleep(ms: number): Promise<void> {

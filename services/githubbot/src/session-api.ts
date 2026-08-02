@@ -56,7 +56,11 @@ export class SessionApiError extends Error {
 export function isRetryableSessionApiError(error: unknown): boolean {
   if (error instanceof SessionApiError) return error.retryable;
   if (!(error instanceof Error)) return false;
-  return error.name === "AbortError" || error.name === "TypeError";
+  return (
+    error.name === "AbortError" ||
+    error.name === "TimeoutError" ||
+    error.name === "TypeError"
+  );
 }
 
 type ForwardSessionApiCallbacks = {
@@ -600,11 +604,16 @@ export type EmitWorkflowEventInput = {
   payload: JsonObject;
 };
 
+const WORKFLOW_EVENT_MAX_RETRIES = 3;
+const WORKFLOW_EVENT_REQUEST_TIMEOUT_MS = 5_000;
+
 /**
  * Emit a durable workflow event (`POST /api/workflows/events`), resolving any
  * `ctx.wait_for_event` waiters keyed on the same (event_type, correlation_id).
- * Best-effort by contract — never throws: a failed emission must not fail the
- * webhook handler, and waiters fall back to their timeout path on a miss.
+ * Delivery is idempotent on (event_type, correlation_id), so transient API
+ * failures are retried with a bounded backoff. The lifecycle handler runs this
+ * through backgroundWaitUntil: delivery survives the webhook response and is
+ * included in graceful-shutdown draining without delaying PR management.
  */
 export async function emitWorkflowEvent(
   options: GithubbotOptions,
@@ -614,32 +623,48 @@ export async function emitWorkflowEvent(
     "/api/workflows/events",
     ensureTrailingSlash(options.apiUrl),
   ).toString();
-  try {
-    const fetchFn = options.fetch ?? fetch;
-    const response = await fetchFn(url, {
-      method: "POST",
-      headers: apiHeaders(options),
-      body: JSON.stringify({
-        event_type: input.eventType,
-        correlation_id: input.correlationId,
-        payload: input.payload,
-      }),
-    });
-    if (!response.ok) {
-      (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
-        correlation_id: input.correlationId,
-        event_type: input.eventType,
-        status: response.status,
-        status_text: response.statusText,
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= WORKFLOW_EVENT_MAX_RETRIES; attempt++) {
+    try {
+      const fetchFn = options.fetch ?? fetch;
+      const response = await fetchFn(url, {
+        method: "POST",
+        headers: apiHeaders(options),
+        body: JSON.stringify({
+          event_type: input.eventType,
+          correlation_id: input.correlationId,
+          payload: input.payload,
+        }),
+        signal: AbortSignal.timeout(WORKFLOW_EVENT_REQUEST_TIMEOUT_MS),
       });
+      await ensureApiOk(response, "emit workflow event", options);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt === WORKFLOW_EVENT_MAX_RETRIES ||
+        !isRetryableSessionApiError(error)
+      ) {
+        break;
+      }
+      await sleep(workflowEventRetryDelayMs(attempt));
     }
-  } catch (error) {
-    (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
-      correlation_id: input.correlationId,
-      error: errorMessage(error),
-      event_type: input.eventType,
-    });
   }
+
+  (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
+    correlation_id: input.correlationId,
+    error: errorMessage(lastError),
+    event_type: input.eventType,
+  });
+  throw lastError;
+}
+
+function workflowEventRetryDelayMs(attempt: number): number {
+  return Math.min(250 * 4 ** attempt, 4_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function apiSessionUrl(
