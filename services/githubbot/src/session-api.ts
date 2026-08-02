@@ -607,14 +607,7 @@ export type EmitWorkflowEventInput = {
 const WORKFLOW_EVENT_MAX_RETRIES = 3;
 const WORKFLOW_EVENT_REQUEST_TIMEOUT_MS = 5_000;
 
-/**
- * Emit a durable workflow event (`POST /api/workflows/events`), resolving any
- * `ctx.wait_for_event` waiters keyed on the same (event_type, correlation_id).
- * Delivery is idempotent on (event_type, correlation_id), so transient API
- * failures are retried with a bounded backoff. The lifecycle handler runs this
- * through backgroundWaitUntil: delivery survives the webhook response and is
- * included in graceful-shutdown draining without delaying PR management.
- */
+/** Emit an idempotent durable workflow event, retrying transient failures. */
 export async function emitWorkflowEvent(
   options: GithubbotOptions,
   input: EmitWorkflowEventInput,
@@ -623,10 +616,10 @@ export async function emitWorkflowEvent(
     "/api/workflows/events",
     ensureTrailingSlash(options.apiUrl),
   ).toString();
+  const fetchFn = options.fetch ?? fetch;
   let lastError: unknown;
   for (let attempt = 0; attempt <= WORKFLOW_EVENT_MAX_RETRIES; attempt++) {
     try {
-      const fetchFn = options.fetch ?? fetch;
       const response = await fetchFn(url, {
         method: "POST",
         headers: apiHeaders(options),
@@ -660,7 +653,7 @@ export async function emitWorkflowEvent(
 }
 
 function workflowEventRetryDelayMs(attempt: number): number {
-  return Math.min(250 * 4 ** attempt, 4_000);
+  return 250 * 4 ** attempt;
 }
 
 function sleep(ms: number): Promise<void> {

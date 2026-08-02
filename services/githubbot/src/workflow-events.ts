@@ -24,7 +24,6 @@ export type WorkflowEventProducerContext = {
 
 type JsonRecord = Record<string, unknown>;
 
-// The event-type contract waiters key on.
 export const WORKFLOW_EVENT_CI_COMPLETED = "ci-completed";
 export const WORKFLOW_EVENT_REVIEW_SUBMITTED = "review-submitted";
 
@@ -42,12 +41,6 @@ function reviewCorrelationId(
   return `${owner}/${repo}:pr-${number}:${headSha}:${reviewer}`.toLowerCase();
 }
 
-// ---------------------------------------------------------------------------
-// Settled-CI evaluation (shared with the owned-PR manager).
-// ---------------------------------------------------------------------------
-
-// CI conclusions that count as a hard, fixable failure (neutral/skipped/success
-// and the in-progress states are not failures).
 const FAILED_CONCLUSIONS = new Set([
   "action_required",
   "cancelled",
@@ -81,11 +74,6 @@ export type CiEvaluation = {
   failingNames: string[];
 };
 
-/**
- * Decide whether all CI for a SHA is finished, and whether it's red. "Settled"
- * means no check run is still queued/in-progress and no legacy commit status is
- * pending — the point a waiter wants to wake at before acting.
- */
 export function evaluateCi(
   checks: CiCheck[],
   statuses: CiStatus[],
@@ -114,11 +102,8 @@ export function evaluateCi(
   };
 }
 
-// The settled gate reads GitHub's own check rollup, not the per-check REST
-// lists: one authoritative aggregate (the same rollup `gh pr checks` uses),
-// including EXPECTED — a required check that hasn't reported yet, which no
-// list merge can see. The REST check-runs list is also unreadable by
-// fine-grained PATs (403), while the rollup state is not.
+// The rollup includes EXPECTED required checks and remains readable when a
+// fine-grained PAT cannot access the REST check-runs endpoint.
 const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectID!, $after: String) {
   repository(owner: $owner, name: $repo) {
     object(oid: $sha) {
@@ -198,18 +183,7 @@ type CiRollupResponse = {
   repository?: { object?: { statusCheckRollup?: CiRollup | null } | null } | null;
 };
 
-/**
- * Read the aggregate CI state for a sha. Returns null when the rollup can't
- * be read: an unreadable rollup is UNKNOWN, never "settled" — emitting or
- * acting on an empty evaluation would manufacture a green signal out of thin
- * air (a commit with genuinely no checks has no rollup either, and emits
- * nothing because no CI webhook ever fires for it).
- *
- * Per-context detail is best-effort: fine-grained PATs get FORBIDDEN on the
- * context nodes (they arrive null with a partial-data error we salvage the
- * state from), so `failingNames` is empty under a PAT and full under GitHub
- * App auth. Callers needing names should re-read with their own credentials.
- */
+/** Read the complete CI rollup, returning null rather than assuming green. */
 export async function fetchCiEvaluation(
   ctx: WorkflowEventProducerContext,
   owner: string,
@@ -268,11 +242,11 @@ export async function fetchCiEvaluation(
   const detail = detailReadable ? evaluateCiRollupContexts(nodes) : null;
   const aggregatePending = rollupState === "PENDING" || rollupState === "EXPECTED";
   const countsPending = stateCountsPending(checkRunCounts, statusContextCounts);
-  const settled = detail
-    ? detail.settled && !aggregatePending
-    : countsPending === undefined
-      ? rollupState === "SUCCESS"
-      : !aggregatePending && !countsPending;
+  let settled = rollupState === "SUCCESS";
+  if (detail) settled = detail.settled && !aggregatePending;
+  else if (countsPending !== undefined) {
+    settled = !aggregatePending && !countsPending;
+  }
   return {
     settled,
     failed:
@@ -297,8 +271,7 @@ function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
 function latestCiChecks(nodes: CiRollupContext[]): CiRollupCheck[] {
   const latest = new Map<string, CiRollupCheck>();
   for (const node of nodes) {
-    if (node.__typename !== "CheckRun" || !node.name || !node.status) continue;
-    const check: CiRollupCheck = { ...node, name: node.name, status: node.status };
+    if (!isCiRollupCheck(node)) continue;
     const workflowRun = node.checkSuite?.workflowRun;
     const key = [
       node.checkSuite?.app?.slug ?? "",
@@ -308,7 +281,7 @@ function latestCiChecks(nodes: CiRollupContext[]): CiRollupCheck[] {
     ].join("\0");
     const current = latest.get(key);
     if (!current || (node.startedAt ?? "") >= (current.startedAt ?? "")) {
-      latest.set(key, check);
+      latest.set(key, node);
     }
   }
   return [...latest.values()];
@@ -317,17 +290,21 @@ function latestCiChecks(nodes: CiRollupContext[]): CiRollupCheck[] {
 function latestCiStatuses(nodes: CiRollupContext[]): CiRollupStatus[] {
   const latest = new Map<string, CiRollupStatus>();
   for (const node of nodes) {
-    if (node.__typename !== "StatusContext" || !node.context || !node.state) continue;
+    if (!isCiRollupStatus(node)) continue;
     const current = latest.get(node.context);
     if (!current || (node.createdAt ?? "") >= (current.createdAt ?? "")) {
-      latest.set(node.context, {
-        ...node,
-        context: node.context,
-        state: node.state,
-      });
+      latest.set(node.context, node);
     }
   }
   return [...latest.values()];
+}
+
+function isCiRollupCheck(node: CiRollupContext): node is CiRollupCheck {
+  return node.__typename === "CheckRun" && Boolean(node.name && node.status);
+}
+
+function isCiRollupStatus(node: CiRollupContext): node is CiRollupStatus {
+  return node.__typename === "StatusContext" && Boolean(node.context && node.state);
 }
 
 function stateCountsPending(
@@ -341,28 +318,10 @@ function stateCountsPending(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Emission.
-// ---------------------------------------------------------------------------
-
-// How long to wait before re-reading a settled-green rollup: a push can read
-// SUCCESS for a few seconds between the first no-op checks completing and the
-// real suite registering (observed live: SUCCESS at T+1s, PENDING at T+7s),
-// and an emission on that false green locks the immutable event row while the
-// suite is still running. A red rollup needs no confirm — a completed failure
-// is already complete.
+// A push can briefly read SUCCESS before the real suite registers. Confirming
+// avoids locking the immutable event row with that false green.
 const DEFAULT_CI_SETTLE_CONFIRM_MS = 15_000;
 
-/**
- * Emit `ci-completed` for workflow waiters once every check for a head sha has
- * settled — per rule 1 above, a single check's completion must never fire it,
- * and a green rollup is confirmed with a delayed second read against the
- * registration race. The aggregate payload can't see *required* checks, so
- * waiters still verify with one live read on wake: the event is the wake-up,
- * not the verdict. The initial evaluation is returned for the owned-PR path;
- * confirmation and delivery run in the returned promise so they do not delay
- * PR management.
- */
 export async function prepareCiCompleted(
   ctx: WorkflowEventProducerContext,
   eventType: string,
@@ -373,15 +332,18 @@ export async function prepareCiCompleted(
   emission: Promise<void> | null;
   evaluation: CiEvaluation | null;
 }> {
-  if (ctx.options.workflowEvents !== true || !ciCompletionSignaled(eventType, payload)) {
+  if (
+    ctx.options.workflowEvents !== true ||
+    !ciCompletionSignaled(eventType, payload)
+  ) {
     return { emission: null, evaluation: null };
   }
   const evaluation = await fetchCiEvaluation(ctx, repo.owner, repo.repo, headSha);
-  if (!evaluation?.settled) return { emission: null, evaluation };
-
   return {
     evaluation,
-    emission: emitCiCompleted(ctx, repo, headSha, evaluation),
+    emission: evaluation?.settled
+      ? emitCiCompleted(ctx, repo, headSha, evaluation)
+      : null,
   };
 }
 
@@ -407,11 +369,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Cheap pre-filter before spending two GitHub API reads on the settled
- * evaluation: only an event signaling something finished (a completed
- * run/suite, or a terminal legacy status) can flip the aggregate to settled.
- */
 function ciCompletionSignaled(eventType: string, payload: JsonRecord): boolean {
   if (eventType === "status") {
     const state = stringValue(payload.state);
@@ -420,14 +377,6 @@ function ciCompletionSignaled(eventType: string, payload: JsonRecord): boolean {
   return stringValue(payload.action) === "completed";
 }
 
-/**
- * Emit `review-submitted` for every submitted review on any PR (owned or
- * not), keyed by head sha AND reviewer login: reviews from different authors
- * get independent rows, so a waiter keys on the author it cares about and a
- * review from anyone else can never consume its correlation. One row per
- * (PR, sha, author) — a second review by the same author on the same sha
- * collapses, which is the complete signal: "author reviewed this head".
- */
 export async function maybeEmitReviewSubmitted(
   ctx: WorkflowEventProducerContext,
   repo: { owner: string; repo: string },

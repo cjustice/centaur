@@ -144,23 +144,9 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
-  /**
-   * Delay (ms) before re-reading a settled-green check rollup to confirm it
-   * isn't a registration race (push → first no-op checks complete → the
-   * rollup reads SUCCESS before the real suite registers). Default 15000;
-   * tests set 0.
-   */
+  /** Delay before confirming a settled-green rollup. Default 15000ms. */
   ciSettleConfirmMs?: number;
-  /**
-   * Emit durable workflow events (`POST /api/workflows/events` on api-rs) from
-   * lifecycle webhooks, before any owned-PR gating: `ci-completed` once every
-   * check for a head sha has settled (durable events are immutable per
-   * correlation, so a single check's completion must never fire it), and
-   * `review-submitted` on every submitted review. Correlation ids key on
-   * repo + head sha (+ reviewer login for reviews) so durable workflows can
-   * wait for exactly the push — and reviewer — they care about. Default
-   * false.
-   */
+  /** Emit settled CI and submitted-review workflow events. Default false. */
   workflowEvents?: boolean;
   /** Delete the head branch after the bot merges an owned PR. Default true. */
   deleteBranchOnMerge?: boolean;

@@ -385,9 +385,6 @@ export async function handleCiEvent(
   if (!repo) return;
   const target = ciTarget(eventType, payload);
   if (!target) return;
-  // The initial rollup read is shared with owned-PR management. Green
-  // confirmation and event delivery continue in the background so they never
-  // hold up CI fixes or merges.
   const { emission, evaluation } = await prepareCiCompleted(
     ctx,
     eventType,
