@@ -115,12 +115,18 @@ module Api
     DEFAULT_PAGE_LIMIT = 50
     MAX_PAGE_LIMIT = 200
 
-    def paginated_label_search(scope)
+    def paginated_label_search(scope, label_filter: nil)
       namespace = params.require(:namespace)
 
       labels = label_filter_params
       filtered = scope.where(namespace: namespace)
-      filtered = filtered.where("labels @> ?", labels.to_json) if labels.any?
+      filtered = if label_filter
+        label_filter.call(filtered, labels)
+      elsif labels.any?
+        filtered.where("labels @> ?", labels.to_json)
+      else
+        filtered
+      end
 
       limit = pagination_limit
       page = pagination_page
