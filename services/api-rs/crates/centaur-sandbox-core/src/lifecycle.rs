@@ -123,6 +123,11 @@ impl ObservedSandbox {
         }
     }
 
+    pub fn with_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+
     pub fn with_created_at(mut self, created_at: Option<SystemTime>) -> Self {
         self.created_at = created_at;
         self

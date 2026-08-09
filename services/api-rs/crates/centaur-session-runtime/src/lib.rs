@@ -13,7 +13,7 @@ use std::{
 
 use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
-    Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
+    Mount, ObservedSandbox, RepoCacheAccess, ResourceRequirements, SandboxBackend,
     SandboxCapabilities as BackendSandboxCapabilities, SandboxError, SandboxId, SandboxIoGuard,
     SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
 };
@@ -4128,8 +4128,12 @@ async fn reattach_session_pipe(
     }
 
     let id = SandboxId::new(sandbox_id);
-    match ctx.manager.status(&id).await {
-        Ok(status) if status.can_open_io() => match ctx.manager.open_io(&id).await {
+    // Observe rather than bare status: the observation carries the
+    // backend-owned diagnostic reason (OOM-kill, eviction, pod deletion),
+    // which is the difference between an actionable terminal error and an
+    // opaque "no longer accepts io" for a sandbox that died mid-execution.
+    match ctx.manager.observe(&id).await {
+        Ok(observed) if observed.status.can_open_io() => match ctx.manager.open_io(&id).await {
             Ok(io) => {
                 let parts = io.into_parts();
                 let new_pipe = session_pipe_from_stdin(parts.stdin);
@@ -4146,13 +4150,25 @@ async fn reattach_session_pipe(
                 ReattachOutcome::Retryable(format!("sandbox stdout reattach failed: {error}"))
             }
         },
-        Ok(status) => {
-            ReattachOutcome::Dead(format!("sandbox no longer accepts io (status {status:?})"))
-        }
+        Ok(observed) => ReattachOutcome::Dead(detached_sandbox_detail(&observed)),
         Err(SandboxError::NotFound(_)) => {
             ReattachOutcome::Dead("sandbox no longer exists".to_owned())
         }
         Err(error) => ReattachOutcome::Retryable(format!("sandbox status check failed: {error}")),
+    }
+}
+
+/// Terminal detail for a sandbox that will not serve I/O again, appending the
+/// backend-owned diagnostic (OOM-kill, eviction, pod deletion) when the
+/// backend observed one.
+fn detached_sandbox_detail(observed: &ObservedSandbox) -> String {
+    let detail = format!(
+        "sandbox no longer accepts io (status {:?})",
+        observed.status
+    );
+    match observed.reason.as_deref().map(str::trim) {
+        Some(reason) if !reason.is_empty() => format!("{detail}: {reason}"),
+        _ => detail,
     }
 }
 
@@ -7427,6 +7443,30 @@ mod tests {
     }
 
     #[test]
+    fn detached_sandbox_detail_appends_backend_diagnostic_reason() {
+        let observed = ObservedSandbox::new("sbx-1", "mock", SandboxStatus::Stopped).with_reason(
+            Some("container \"agent\" OOM-killed (exit code 137)".to_owned()),
+        );
+        assert_eq!(
+            detached_sandbox_detail(&observed),
+            "sandbox no longer accepts io (status Stopped): container \"agent\" OOM-killed (exit code 137)"
+        );
+
+        let without_reason = ObservedSandbox::new("sbx-1", "mock", SandboxStatus::Created);
+        assert_eq!(
+            detached_sandbox_detail(&without_reason),
+            "sandbox no longer accepts io (status Created)"
+        );
+
+        let blank_reason = ObservedSandbox::new("sbx-1", "mock", SandboxStatus::Created)
+            .with_reason(Some("  ".to_owned()));
+        assert_eq!(
+            detached_sandbox_detail(&blank_reason),
+            "sandbox no longer accepts io (status Created)"
+        );
+    }
+
+    #[test]
     fn execution_metadata_preserves_idle_and_max_duration() {
         let metadata =
             execution_metadata(Some(json!({"source": "test"})), Some(2_000), Some(5_000));
@@ -8453,6 +8493,7 @@ mod adoption_tests {
         open_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
         observed_statuses: std::sync::Mutex<BTreeMap<String, SandboxStatus>>,
+        observed_reasons: std::sync::Mutex<BTreeMap<String, String>>,
         create_id: String,
         created_specs: std::sync::Mutex<Vec<SandboxSpec>>,
         resume_fails: AtomicBool,
@@ -8469,6 +8510,7 @@ mod adoption_tests {
                 open_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
                 observed_statuses: std::sync::Mutex::new(BTreeMap::new()),
+                observed_reasons: std::sync::Mutex::new(BTreeMap::new()),
                 create_id: "mock-sbx".to_owned(),
                 created_specs: std::sync::Mutex::new(Vec::new()),
                 resume_fails: AtomicBool::new(false),
@@ -8499,6 +8541,13 @@ mod adoption_tests {
                 .lock()
                 .unwrap()
                 .insert(sandbox_id.to_owned(), status);
+        }
+
+        fn set_observed_reason(&self, sandbox_id: &str, reason: &str) {
+            self.observed_reasons
+                .lock()
+                .unwrap()
+                .insert(sandbox_id.to_owned(), reason.to_owned());
         }
 
         fn status_of(&self, sandbox_id: &str) -> Option<SandboxStatus> {
@@ -8574,7 +8623,13 @@ mod adoption_tests {
 
         async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
             let status = self.status(id).await?;
-            Ok(ObservedSandbox::new(id.clone(), "mock", status))
+            let reason = self
+                .observed_reasons
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .cloned();
+            Ok(ObservedSandbox::new(id.clone(), "mock", status).with_reason(reason))
         }
 
         async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -8738,6 +8793,27 @@ mod adoption_tests {
         .await
         .expect("expire stdout lease");
         assert_eq!(result.rows_affected(), 1, "expected to expire one lease");
+    }
+
+    /// Gives the test runtime the stdout-owner lease the execute path would
+    /// have claimed for a live execution; output and terminal updates are
+    /// fenced on that ownership.
+    async fn claim_runtime_stdout_owner(
+        store: &PgSessionStore,
+        execution_id: &str,
+        runtime: &SessionRuntime,
+    ) {
+        assert!(
+            store
+                .claim_stdout_owner(
+                    execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim stdout owner"),
+            "expected to claim stdout ownership"
+        );
     }
 
     async fn wait_for_event(store: &PgSessionStore, thread_key: &ThreadKey, event_type: &str) {
@@ -9673,13 +9749,15 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        claim_runtime_stdout_owner(&store, &execution_id, &runtime).await;
         runtime
             .ensure_session_pipe(&thread_key, "sbx-recorded")
             .await
@@ -9723,7 +9801,8 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (first_io, mut first_stdout, _first_stdin) = mock_io();
@@ -9732,6 +9811,7 @@ mod adoption_tests {
         backend.push_io(second_io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        claim_runtime_stdout_owner(&store, &execution_id, &runtime).await;
         runtime
             .ensure_session_pipe(&thread_key, "sbx-reattach")
             .await
@@ -9844,13 +9924,14 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        claim_runtime_stdout_owner(&store, &execution_id, &runtime).await;
         runtime
             .ensure_session_pipe(&thread_key, "sbx-gone")
             .await
@@ -9877,6 +9958,50 @@ mod adoption_tests {
             !all.iter()
                 .any(|event| event.event_type == "session.stdout_pump_reattached"),
             "gone sandbox should not reattach"
+        );
+        assert_eq!(backend.opens(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_failure_names_backend_diagnostic_reason() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-oom-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-oom"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        claim_runtime_stdout_owner(&store, &execution_id, &runtime).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-oom")
+            .await
+            .expect("open initial pipe");
+        // The agent-k8s backend surfaces an OOM-kill this way while the pod
+        // phase settles from Running to Failed.
+        backend.set_status(SandboxStatus::Stopped);
+        backend.set_observed_reason("sbx-oom", "container \"agent\" OOM-killed (exit code 137)");
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox no longer accepts io (status Stopped)"),
+            "expected sandbox status detail: {error}"
+        );
+        assert!(
+            error.contains("container \"agent\" OOM-killed (exit code 137)"),
+            "expected the backend diagnostic reason in the failure: {error}"
         );
         assert_eq!(backend.opens(), 1);
     }

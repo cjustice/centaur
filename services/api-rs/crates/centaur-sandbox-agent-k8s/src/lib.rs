@@ -15,7 +15,9 @@ use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
     SandboxResult, SandboxSpec, SandboxStatus,
 };
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{
+    ContainerStateTerminated, ContainerStatus, PersistentVolumeClaim, Pod,
+};
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
@@ -245,6 +247,10 @@ impl AgentSandboxBackend {
         let pod = self.get_pod(id).await?;
         let status = sandbox_status_from_pod(replicas, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
+            .with_reason(pod_diagnostic_reason(
+                pod.as_ref(),
+                &self.config.container_name,
+            ))
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox)))
     }
@@ -662,6 +668,129 @@ fn pod_ready(pod: &Pod) -> bool {
         })
 }
 
+/// Best-effort diagnostic for a sandbox that cannot serve I/O, surfaced as
+/// `ObservedSandbox.reason` so failure paths (reattach, reconciliation) can
+/// name the real cause — OOM-kill, eviction, image pull failure — instead of
+/// the opaque portable status. A healthy running pod carries no reason.
+fn pod_diagnostic_reason(pod: Option<&Pod>, container_name: &str) -> Option<String> {
+    let Some(pod) = pod else {
+        // The Sandbox CR exists but its backing pod does not: external
+        // deletion (janitor, node pressure, manual reap) before the
+        // controller recreates it.
+        return Some("backing pod not found".to_owned());
+    };
+    let mut details: Vec<String> = Vec::new();
+    if pod.metadata.deletion_timestamp.is_some() {
+        details.push("pod deletion in progress".to_owned());
+    }
+    let status = pod.status.as_ref();
+    let phase = status
+        .and_then(|status| status.phase.as_deref())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    match phase.as_str() {
+        "failed" | "succeeded" => {
+            let mut detail = format!("pod {phase}");
+            if let Some(reason) = status.and_then(|status| status.reason.as_deref()) {
+                detail = format!("{detail} (reason {reason})");
+            }
+            details.push(detail);
+        }
+        "pending" => details.push("pod pending".to_owned()),
+        "running" if !pod_ready(pod) => details.push("pod running but not ready".to_owned()),
+        _ => {}
+    }
+    if let Some(detail) = container_diagnostic_detail(pod, container_name) {
+        details.push(detail);
+    }
+    if details.is_empty() {
+        None
+    } else {
+        Some(details.join("; "))
+    }
+}
+
+/// Diagnostic for the most relevant container in the pod. The agent container
+/// wins over init/sidecar containers; containers that completed cleanly
+/// (finished init containers) are not diagnostics.
+fn container_diagnostic_detail(pod: &Pod, container_name: &str) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    let statuses = status
+        .container_statuses
+        .iter()
+        .chain(status.init_container_statuses.iter())
+        .flatten();
+    let mut fallback = None;
+    for container in statuses {
+        let detail = container_state_detail(container, container.name == container_name);
+        if container.name == container_name && detail.is_some() {
+            return detail;
+        }
+        fallback = fallback.or(detail);
+    }
+    fallback
+}
+
+fn container_state_detail(container: &ContainerStatus, is_agent: bool) -> Option<String> {
+    let name = container.name.as_str();
+    if let Some(terminated) = container
+        .state
+        .as_ref()
+        .and_then(|state| state.terminated.as_ref())
+    {
+        // A cleanly completed non-agent container (e.g. a finished init
+        // container) is normal, not a diagnostic.
+        if !is_agent && terminated.exit_code == 0 {
+            return None;
+        }
+        return Some(terminated_detail(name, false, terminated));
+    }
+    if let Some(waiting) = container
+        .state
+        .as_ref()
+        .and_then(|state| state.waiting.as_ref())
+        && let Some(reason) = waiting.reason.as_deref()
+    {
+        return Some(format!("container \"{name}\" waiting (reason {reason})"));
+    }
+    // With restartPolicy Never a dead container stays in `state.terminated`;
+    // `last_state.terminated` only fills after a restart, but covers pod
+    // templates that restart in place.
+    if let Some(terminated) = container
+        .last_state
+        .as_ref()
+        .and_then(|state| state.terminated.as_ref())
+    {
+        if !is_agent && terminated.exit_code == 0 {
+            return None;
+        }
+        return Some(terminated_detail(name, true, terminated));
+    }
+    None
+}
+
+fn terminated_detail(name: &str, restarted: bool, terminated: &ContainerStateTerminated) -> String {
+    let exit_code = terminated.exit_code;
+    match (terminated.reason.as_deref(), restarted) {
+        (Some("OOMKilled"), false) => {
+            format!("container \"{name}\" OOM-killed (exit code {exit_code})")
+        }
+        (Some("OOMKilled"), true) => {
+            format!("container \"{name}\" previously OOM-killed (exit code {exit_code})")
+        }
+        (Some(reason), false) => {
+            format!("container \"{name}\" terminated (reason {reason}, exit code {exit_code})")
+        }
+        (Some(reason), true) => {
+            format!(
+                "container \"{name}\" previously terminated (reason {reason}, exit code {exit_code})"
+            )
+        }
+        (None, false) => format!("container \"{name}\" exited (exit code {exit_code})"),
+        (None, true) => format!("container \"{name}\" previously exited (exit code {exit_code})"),
+    }
+}
+
 fn build_agent_sandbox(
     id: &SandboxId,
     spec: &SandboxSpec,
@@ -988,7 +1117,9 @@ mod tests {
     use centaur_sandbox_core::{
         RepoCacheAccess, ResourceRequirements, SandboxCapabilities, SandboxSpec,
     };
-    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateRunning, ContainerStateWaiting, PodCondition, PodStatus,
+    };
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     use super::*;
@@ -1494,6 +1625,195 @@ mod tests {
             state_pvc_name(&SandboxId::new("asbx-test")),
             "state-asbx-test"
         );
+    }
+
+    #[test]
+    fn pod_diagnostic_reason_names_oom_kill() {
+        // The restartPolicy Never shape: the OOM-killed container stays in
+        // `state.terminated` while the pod phase settles to Failed.
+        let failed_pod = pod_with_container_state(
+            "Failed",
+            false,
+            agent_container_state(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 137,
+                    reason: Some("OOMKilled".to_owned()),
+                    ..ContainerStateTerminated::default()
+                }),
+                ..ContainerState::default()
+            }),
+        );
+        assert_eq!(
+            pod_diagnostic_reason(Some(&failed_pod), "agent"),
+            Some("pod failed; container \"agent\" OOM-killed (exit code 137)".to_owned())
+        );
+
+        // Mid-transition the phase can still be Running; the container state
+        // must still name the OOM-kill.
+        let stale_running_pod = pod_with_container_state(
+            "Running",
+            false,
+            agent_container_state(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 137,
+                    reason: Some("OOMKilled".to_owned()),
+                    ..ContainerStateTerminated::default()
+                }),
+                ..ContainerState::default()
+            }),
+        );
+        assert_eq!(
+            pod_diagnostic_reason(Some(&stale_running_pod), "agent"),
+            Some(
+                "pod running but not ready; container \"agent\" OOM-killed (exit code 137)"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn pod_diagnostic_reason_names_eviction_and_deletion() {
+        let mut evicted_pod = pod_with_phase_and_ready("Failed", false);
+        evicted_pod.status.as_mut().unwrap().reason = Some("Evicted".to_owned());
+        assert_eq!(
+            pod_diagnostic_reason(Some(&evicted_pod), "agent"),
+            Some("pod failed (reason Evicted)".to_owned())
+        );
+
+        let mut deleting_pod = pod_with_phase_and_ready("Running", true);
+        deleting_pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::now()),
+        );
+        assert_eq!(
+            pod_diagnostic_reason(Some(&deleting_pod), "agent"),
+            Some("pod deletion in progress".to_owned())
+        );
+
+        assert_eq!(
+            pod_diagnostic_reason(None, "agent"),
+            Some("backing pod not found".to_owned())
+        );
+    }
+
+    #[test]
+    fn pod_diagnostic_reason_prefers_agent_container_and_skips_healthy_pods() {
+        // A waiting agent container names the wait reason (image pull,
+        // crash loop) even when a sidecar also has a diagnostic.
+        let pod = pod_with_container_state(
+            "Pending",
+            false,
+            vec![
+                ContainerStatus {
+                    name: "agent".to_owned(),
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("ImagePullBackOff".to_owned()),
+                            ..ContainerStateWaiting::default()
+                        }),
+                        ..ContainerState::default()
+                    }),
+                    ..ContainerStatus::default()
+                },
+                ContainerStatus {
+                    name: "tools-bootstrap".to_owned(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 1,
+                            reason: Some("Error".to_owned()),
+                            ..ContainerStateTerminated::default()
+                        }),
+                        ..ContainerState::default()
+                    }),
+                    ..ContainerStatus::default()
+                },
+            ],
+        );
+        assert_eq!(
+            pod_diagnostic_reason(Some(&pod), "agent"),
+            Some("pod pending; container \"agent\" waiting (reason ImagePullBackOff)".to_owned())
+        );
+
+        // A healthy running pod with a cleanly completed init container has
+        // no diagnostic.
+        let healthy = pod_with_container_state(
+            "Running",
+            true,
+            vec![
+                ContainerStatus {
+                    name: "agent".to_owned(),
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning::default()),
+                        ..ContainerState::default()
+                    }),
+                    ..ContainerStatus::default()
+                },
+                ContainerStatus {
+                    name: "tools-bootstrap".to_owned(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            reason: Some("Completed".to_owned()),
+                            ..ContainerStateTerminated::default()
+                        }),
+                        ..ContainerState::default()
+                    }),
+                    ..ContainerStatus::default()
+                },
+            ],
+        );
+        assert_eq!(pod_diagnostic_reason(Some(&healthy), "agent"), None);
+    }
+
+    #[test]
+    fn pod_diagnostic_reason_reads_last_terminated_state_after_restart() {
+        // restartPolicy Never keeps a dead container in `state.terminated`;
+        // a template that restarts in place reports the kill through
+        // `last_state.terminated` instead.
+        let pod = pod_with_container_state(
+            "Running",
+            false,
+            vec![ContainerStatus {
+                name: "agent".to_owned(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..ContainerState::default()
+                }),
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 137,
+                        reason: Some("OOMKilled".to_owned()),
+                        ..ContainerStateTerminated::default()
+                    }),
+                    ..ContainerState::default()
+                }),
+                ..ContainerStatus::default()
+            }],
+        );
+        assert_eq!(
+            pod_diagnostic_reason(Some(&pod), "agent"),
+            Some(
+                "pod running but not ready; container \"agent\" previously OOM-killed (exit code 137)"
+                    .to_owned()
+            )
+        );
+    }
+
+    fn agent_container_state(state: ContainerState) -> Vec<ContainerStatus> {
+        vec![ContainerStatus {
+            name: "agent".to_owned(),
+            state: Some(state),
+            ..ContainerStatus::default()
+        }]
+    }
+
+    fn pod_with_container_state(
+        phase: &str,
+        ready: bool,
+        container_statuses: Vec<ContainerStatus>,
+    ) -> Pod {
+        let mut pod = pod_with_phase_and_ready(phase, ready);
+        pod.status.as_mut().unwrap().container_statuses = Some(container_statuses);
+        pod
     }
 
     fn pod_with_phase_and_ready(phase: &str, ready: bool) -> Pod {
