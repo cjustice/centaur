@@ -84,6 +84,10 @@ module Oauth
       assert_not StaticSecret.exists?(duplicate_secret.id)
       assert_not Grant.exists?(grant.id)
       assert StaticSecret.exists?(canonical_secret.id)
+      assert(
+        canonical_secret.grants.exists?(principal_id: grant.principal_id),
+        "the duplicate's grant should carry over to the surviving wrapper"
+      )
     end
 
     test "replaces the refresh token when the duplicate carries one" do
@@ -131,6 +135,43 @@ module Oauth
       assert_equal %w[repo read:user], canonical.scopes
       assert_not BrokerCredential.exists?(duplicate.id)
       assert_not StaticSecret.exists?(duplicate_secret.id)
+    end
+
+    test "grants the survivor's wrapper even when the token does not move" do
+      # The out-of-order branch skips update!, so nothing re-fires
+      # auto_grant_matching_principals -- the merge has to reconcile itself, or
+      # the duplicate's grants die with its wrapper and no grant replaces them.
+      canonical = credential(
+        subject: "99123",
+        foreign_id: "github-github-99123",
+        access_token: "gho-newer",
+        last_refresh: Time.current
+      )
+      canonical_secret = wrap(canonical)
+      principal = principals(:acme_user_alice)
+      principal.grants.where(static_secret: canonical_secret).destroy_all
+
+      duplicate = credential(
+        subject: "pending-abc123",
+        foreign_id: "github-github-pending-abc123",
+        access_token: "gho-older",
+        last_refresh: 1.hour.ago
+      )
+      duplicate_secret = wrap(duplicate)
+      Grant.create!(
+        principal: principal,
+        static_secret: duplicate_secret,
+        created_by: users(:acme_admin)
+      )
+
+      DuplicateCredentialMerge.new.call(duplicate: duplicate, subject: "99123")
+
+      assert_equal "gho-newer", canonical.reload.access_token, "the older token must not win"
+      assert_not StaticSecret.exists?(duplicate_secret.id)
+      assert(
+        principal.grants.exists?(static_secret: canonical_secret),
+        "the survivor's wrapper should be granted after the duplicate's grants are destroyed"
+      )
     end
 
     test "ignores a credential of another oauth app that shares the subject" do

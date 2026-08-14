@@ -24,28 +24,48 @@ module Oauth
       canonical = canonical_for(duplicate, subject)
       return nil if canonical.nil?
 
+      # Read both before the destroy, so the log never depends on what an
+      # already-destroyed record can still answer.
       duplicate_oid = duplicate.oid
+      provider = duplicate.oauth_app.provider
       BrokerCredential.transaction do
         # The consents can enrich out of order (a double-submitted first
         # connect), so only the newer token wins; either way the duplicate goes.
-        # update! also re-fires auto_grant_matching_principals, re-granting the
-        # surviving wrapper to every principal that still matches the account.
         canonical.update!(rotating_attributes(duplicate, canonical)) if token_newer?(duplicate, canonical)
+        # Every principal that reached the account through the duplicate has to
+        # keep reaching it through the survivor, so move the grants before the
+        # wrapper that owns them is destroyed.
+        transfer_grants(duplicate.static_secret, canonical.static_secret)
         # The wrapper owns the token_broker source that BrokerCredential's
-        # before_destroy guard refuses to orphan, so it has to go first. Its
-        # auto-created grants go with it (StaticSecret dependent: :destroy).
+        # before_destroy guard refuses to orphan, so it has to go first. Any
+        # grants left on it go with it (StaticSecret dependent: :destroy).
         duplicate.static_secret&.destroy!
         duplicate.destroy!
       end
 
       Rails.logger.info do
-        "#{duplicate.oauth_app.provider} oauth credential identity enrichment merged duplicate: " \
+        "#{provider} oauth credential identity enrichment merged duplicate: " \
           "duplicate=#{duplicate_oid} credential=#{canonical.oid}"
       end
       canonical
     end
 
     private
+
+    # Re-running reconciliation would not do this: it grants by *matching* the
+    # credential, so it cannot reconstruct a grant an operator made by hand, and
+    # it skips a principal that matched the duplicate's owner but not the
+    # survivor's. Carrying the rows over keeps every principal's access exactly
+    # as it was, which is the whole point of merging rather than deleting.
+    def transfer_grants(from, to)
+      return if from.nil? || to.nil?
+
+      from.grants.each do |grant|
+        next if to.grants.exists?(principal_id: grant.principal_id)
+
+        to.grants.create!(principal_id: grant.principal_id, created_by: grant.created_by)
+      end
+    end
 
     # At most one row can match: a unique index covers (oauth_app_id,
     # provider_subject) wherever provider_subject is not null. The blank guard
