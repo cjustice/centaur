@@ -35,6 +35,20 @@ module Oauth
         return
       end
 
+      # A repeat consent mints a second credential (the pending subject is
+      # derived from the fresh access token), so hand the token to the
+      # credential that already represents this account instead of colliding
+      # with its foreign_id below.
+      duplicate_oid = credential.oid
+      merged = Oauth::DuplicateCredentialMerge.new.call(duplicate: credential, subject: subject)
+      if merged
+        Rails.logger.info do
+          "github oauth credential identity enrichment merged duplicate: " \
+            "duplicate=#{duplicate_oid} credential=#{merged.oid}"
+        end
+        return
+      end
+
       old_name = credential.name
       credential.update!(
         name: "GitHub – #{display_name}",
@@ -49,7 +63,8 @@ module Oauth
       return if old_name.present? && secret.name != "#{old_name} token"
 
       secret.update!(name: "#{credential.name} token")
-    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique => e
+    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique,
+           ActiveRecord::RecordNotDestroyed => e
       Rails.logger.warn do
         "github oauth credential identity enrichment failed to persist: " \
           "credential=#{credential&.oid || credential_id.inspect} error=#{e.class}"

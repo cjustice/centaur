@@ -29,7 +29,11 @@ module Oauth
       StaticSecret.create!(
         name: name,
         broker_credential: credential,
-        inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }
+        inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+        source: SecretSource.new(
+          source_type: "token_broker",
+          config: { "credential_id" => credential.oid }
+        )
       )
     end
 
@@ -76,6 +80,39 @@ module Oauth
 
       assert_equal "GitHub – Octo Cat", credential.reload.name
       assert_equal "operator name", secret.reload.name
+    end
+
+    test "folds a repeat consent into the already connected account" do
+      Oauth::EnrichGithubCredentialIdentityJob.github_api_http = ->(url:, access_token:) {
+        { "id" => 99_123, "login" => "octocat", "name" => "Octo Cat", "email" => "octo@example.com" }
+      }
+      connected = github_credential(
+        foreign_id: "github-github-99123",
+        name: "GitHub – Octo Cat",
+        provider_subject: "99123",
+        access_token: "gho-old",
+        scopes: %w[repo],
+        last_refresh: 2.hours.ago
+      )
+      connected_secret = wrap_credential(connected)
+      reconsent = github_credential(
+        foreign_id: "github-github-pending-def456",
+        provider_subject: "pending-def456",
+        access_token: "gho-fresh",
+        scopes: %w[repo read:user],
+        last_refresh: Time.current
+      )
+      reconsent_secret = wrap_credential(reconsent)
+
+      Oauth::EnrichGithubCredentialIdentityJob.perform_now(reconsent.id)
+
+      assert_equal [ connected.id ], BrokerCredential.where(oauth_app: oauth_apps(:acme_github)).pluck(:id)
+      connected.reload
+      assert_equal "gho-fresh", connected.access_token
+      assert_equal %w[repo read:user], connected.scopes
+      assert_equal "GitHub – Octo Cat", connected.name
+      assert StaticSecret.exists?(connected_secret.id)
+      assert_not StaticSecret.exists?(reconsent_secret.id)
     end
   end
 end

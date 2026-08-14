@@ -29,7 +29,11 @@ module Oauth
       StaticSecret.create!(
         name: name,
         broker_credential: credential,
-        inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }
+        inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+        source: SecretSource.new(
+          source_type: "token_broker",
+          config: { "credential_id" => credential.oid }
+        )
       )
     end
 
@@ -76,6 +80,42 @@ module Oauth
 
       assert_equal "Linear – Ada Lovelace", credential.reload.name
       assert_equal "operator name", secret.reload.name
+    end
+
+    test "folds a repeat consent into the already connected account" do
+      Oauth::EnrichLinearCredentialIdentityJob.linear_api_http = ->(url:, access_token:, body:) {
+        { "data" => { "viewer" => { "id" => "LinUser_123", "name" => "Ada Lovelace", "email" => "ada@example.com" } } }
+      }
+      connected = linear_credential(
+        foreign_id: "linear-linear-linuser_123",
+        name: "Linear – Ada Lovelace",
+        provider_subject: "LinUser_123",
+        access_token: "lin-old",
+        refresh_token: "lin-refresh-old",
+        scopes: %w[read],
+        last_refresh: 2.hours.ago
+      )
+      connected_secret = wrap_credential(connected)
+      reconsent = linear_credential(
+        foreign_id: "linear-linear-pending-def456",
+        provider_subject: "pending-def456",
+        access_token: "lin-fresh",
+        refresh_token: "lin-refresh-fresh",
+        scopes: %w[read write],
+        last_refresh: Time.current
+      )
+      reconsent_secret = wrap_credential(reconsent)
+
+      Oauth::EnrichLinearCredentialIdentityJob.perform_now(reconsent.id)
+
+      assert_equal [ connected.id ], BrokerCredential.where(oauth_app: oauth_apps(:acme_linear)).pluck(:id)
+      connected.reload
+      assert_equal "lin-fresh", connected.access_token
+      assert_equal "lin-refresh-fresh", connected.refresh_token
+      assert_equal %w[read write], connected.scopes
+      assert_equal "Linear – Ada Lovelace", connected.name
+      assert StaticSecret.exists?(connected_secret.id)
+      assert_not StaticSecret.exists?(reconsent_secret.id)
     end
   end
 end
