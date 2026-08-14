@@ -40,15 +40,7 @@ module Oauth
       # derived from the fresh access token), so hand the token to the
       # credential that already represents this account instead of colliding
       # with its foreign_id below.
-      duplicate_oid = credential.oid
-      merged = Oauth::DuplicateCredentialMerge.new.call(duplicate: credential, subject: subject)
-      if merged
-        Rails.logger.info do
-          "linear oauth credential identity enrichment merged duplicate: " \
-            "duplicate=#{duplicate_oid} credential=#{merged.oid}"
-        end
-        return
-      end
+      return if DuplicateCredentialMerge.new.call(duplicate: credential, subject: subject)
 
       old_name = credential.name
       credential.update!(

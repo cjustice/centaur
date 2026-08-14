@@ -24,9 +24,12 @@ module Oauth
       canonical = canonical_for(duplicate, subject)
       return nil if canonical.nil?
 
+      duplicate_oid = duplicate.oid
       BrokerCredential.transaction do
         # The consents can enrich out of order (a double-submitted first
         # connect), so only the newer token wins; either way the duplicate goes.
+        # update! also re-fires auto_grant_matching_principals, re-granting the
+        # surviving wrapper to every principal that still matches the account.
         canonical.update!(rotating_attributes(duplicate, canonical)) if token_newer?(duplicate, canonical)
         # The wrapper owns the token_broker source that BrokerCredential's
         # before_destroy guard refuses to orphan, so it has to go first. Its
@@ -35,23 +38,25 @@ module Oauth
         duplicate.destroy!
       end
 
-      # update! re-fires auto_grant_matching_principals, so the surviving
-      # wrapper is re-granted to every principal that matches the account before
-      # the duplicate's own grants are dropped.
+      Rails.logger.info do
+        "#{duplicate.oauth_app.provider} oauth credential identity enrichment merged duplicate: " \
+          "duplicate=#{duplicate_oid} credential=#{canonical.oid}"
+      end
       canonical
     end
 
     private
 
-    # At most one row can match: a unique partial index covers
-    # (oauth_app_id, provider_subject).
+    # At most one row can match: a unique index covers (oauth_app_id,
+    # provider_subject) wherever provider_subject is not null. The blank guard
+    # keeps that true -- querying a null subject would match every credential
+    # the index excludes, and destroy one of them.
     def canonical_for(duplicate, subject)
       return nil if subject.blank?
 
       BrokerCredential
         .where(oauth_app_id: duplicate.oauth_app_id, provider_subject: subject)
         .where.not(id: duplicate.id)
-        .order(:id)
         .first
     end
 

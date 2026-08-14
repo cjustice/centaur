@@ -86,7 +86,7 @@ module Oauth
       assert StaticSecret.exists?(canonical_secret.id)
     end
 
-    test "keeps the canonical refresh token replaced when the duplicate carries one" do
+    test "replaces the refresh token when the duplicate carries one" do
       canonical = credential(
         subject: "99123",
         foreign_id: "github-github-99123",
