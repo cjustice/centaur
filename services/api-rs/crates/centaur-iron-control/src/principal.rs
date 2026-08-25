@@ -289,14 +289,12 @@ pub fn derive_slack_requester_principal(
     ))
 }
 
-/// Resolve the requesting user's principal for a GitHub thread. githubbot
-/// forwards the comment author's GitHub user id (``user_id``) and login
-/// (``user_name``) in the execute metadata, both authentic from the
-/// signature-verified webhook payload. The per-user principal keys on the
-/// numeric id, which is also labeled as the `github_subject` so credential
-/// reconciliation can match the owner's connected GitHub OAuth credential by
-/// provider subject. Returns `None` for non-GitHub thread keys and for ids
-/// that are not numeric (GitHub user ids always are).
+/// Resolve the requesting user's principal for a GitHub thread from the
+/// comment author identity githubbot forwards (`user_id`, authentic from the
+/// signature-verified webhook, and `user_name`). Keys on the numeric GitHub
+/// id, labeled `github_subject` so reconciliation matches the owner's
+/// connected GitHub credential by provider subject. Returns `None` for
+/// non-GitHub thread keys and non-numeric ids (GitHub user ids are numeric).
 pub fn derive_github_requester_principal(
     thread_key: &str,
     github_user_id: &str,

@@ -129,9 +129,10 @@ verified sender as `user_id` (numeric GitHub id) and `user_name` in every
 execute, and api-rs upserts a per-user `github-user-<id>` principal labeled
 `github_subject: <id>`. Reconciliation matches GitHub OAuth credentials to it
 by provider subject — GitHub collects no email scope, so the subject is the
-only workable anchor. A commenter can only ever bind their own identity:
-the sender id comes from the signature-verified payload, and turns only run
-for author associations the deployment already allowlisted.
+only workable anchor for these principals (§4). A commenter can only ever
+bind their own identity: the sender id comes from the signature-verified
+payload, and turns only run for author associations the deployment already
+allowlisted.
 
 ### 2. Grant union on the proxy (console)
 
@@ -184,8 +185,19 @@ grants are unaffected either way.
 
 ### 4. Identity-anchored auto-grant (console)
 
-Extend `PrincipalCredentialReconciliation` so providers without a native
-subject (GitHub) match through the credential owner's Slack SSO identity:
+`PrincipalCredentialReconciliation` matches credentials to user principals
+by one precedence rule: a provider-native subject first, the credential
+owner's identity as fallback.
+
+Native subjects: Google matches `google_subject`, and GitHub matches
+`github_subject` — written by api-rs onto `github-user-*` requester
+principals from the signature-verified webhook sender id, which is also the
+`provider_subject` captured at OAuth consent. GitHub's consent flow collects
+no email scope, so the subject is the only workable anchor for these
+principals.
+
+For providers or principals without a native subject, match through the
+credential owner's Slack SSO identity:
 
 - `credential.created_by` must have exactly one Slack `UserIdentity` with
   subject and team present (the same ambiguity refusal as
@@ -207,8 +219,11 @@ principal created later at the user's first mention.
 Trust anchors: `created_by` is set server-side from the authenticated console
 session at consent time and never overwritten. The Slack identity comes from
 Slack's OIDC id_token. The principal foreign_id is derived from
-Slack-signature-verified events. Nothing user-editable participates in
-matching.
+Slack-signature-verified events. The GitHub subject comes from
+signature-verified webhook payloads; a commenter can only ever supply their
+own sender id. The console requester foreign ID is provisioned server-side
+from the authenticated console user and honored only on `console:` thread
+keys. Nothing user-editable participates in matching.
 
 Isolation: the requester binding is applied through the config barrier before
 the turn's input runs, executions are thread-serialized, and the token only
