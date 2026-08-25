@@ -124,6 +124,15 @@ fetch-only for `console:` thread keys — a thread namespace only the console
 service may write — and never upserts console-user principals, whose identity
 fields and reconciliation the console owns.
 
+GitHub turns bind the comment author: githubbot forwards the webhook's
+verified sender as `user_id` (numeric GitHub id) and `user_name` in every
+execute, and api-rs upserts a per-user `github-user-<id>` principal labeled
+`github_subject: <id>`. Reconciliation matches GitHub OAuth credentials to it
+by provider subject — GitHub collects no email scope, so the subject is the
+only workable anchor. A commenter can only ever bind their own identity:
+the sender id comes from the signature-verified payload, and turns only run
+for author associations the deployment already allowlisted.
+
 ### 2. Grant union on the proxy (console)
 
 Add nullable `proxies.requester_principal_id`, accepted by the proxy

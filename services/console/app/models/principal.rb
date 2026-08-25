@@ -34,8 +34,8 @@ class Principal < ApplicationRecord
   SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
-    unknown user console_user workflow slack_channel slack_dm discord_channel linear_issue
-    teams_user teams_conversation
+    unknown user console_user workflow slack_channel slack_dm discord_channel github_user
+    linear_issue teams_user teams_conversation
   ].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/

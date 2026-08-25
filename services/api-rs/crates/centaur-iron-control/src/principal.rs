@@ -31,6 +31,7 @@ use crate::util::{managed_labels, slugify};
 const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
 const DISCORD_CHANNEL_KIND: &str = "discord_channel";
+const GITHUB_USER_KIND: &str = "github_user";
 const LINEAR_ISSUE_KIND: &str = "linear_issue";
 const TEAMS_USER_KIND: &str = "teams_user";
 const TEAMS_CONVERSATION_KIND: &str = "teams_conversation";
@@ -286,6 +287,43 @@ pub fn derive_slack_requester_principal(
         team,
         display_name.map(str::trim).filter(|name| !name.is_empty()),
     ))
+}
+
+/// Resolve the requesting user's principal for a GitHub thread. githubbot
+/// forwards the comment author's GitHub user id (``user_id``) and login
+/// (``user_name``) in the execute metadata, both authentic from the
+/// signature-verified webhook payload. The per-user principal keys on the
+/// numeric id, which is also labeled as the `github_subject` so credential
+/// reconciliation can match the owner's connected GitHub OAuth credential by
+/// provider subject. Returns `None` for non-GitHub thread keys and for ids
+/// that are not numeric (GitHub user ids always are).
+pub fn derive_github_requester_principal(
+    thread_key: &str,
+    github_user_id: &str,
+    display_name: Option<&str>,
+) -> Option<PrincipalRef> {
+    if !thread_key.starts_with("github:") {
+        return None;
+    }
+    let user = github_user_id.trim();
+    if user.is_empty() || !user.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut labels = BTreeMap::new();
+    labels.insert("github_subject".to_owned(), user.to_owned());
+    Some(PrincipalRef {
+        foreign_id: format!("github-user-{}", slugify(user)),
+        name: display_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("GitHub User @{name}"))
+            .unwrap_or_else(|| format!("GitHub User {user}")),
+        kind: Some(GITHUB_USER_KIND.to_owned()),
+        slack_user_id: None,
+        slack_channel_id: None,
+        slack_team_id: None,
+        labels,
+    })
 }
 
 /// The per-user Slack principal shared by the DM branch of
@@ -723,6 +761,45 @@ mod tests {
     fn requester_dm_thread_resolves_none() {
         assert_eq!(
             derive_slack_requester_principal("slack:T123:D9:ts", "U07ABC", "T123", None),
+            None
+        );
+    }
+
+    #[test]
+    fn github_requester_keys_on_the_verified_user_id() {
+        let principal =
+            derive_github_requester_principal("github:acme/widgets:12", "90210001", Some("ada"))
+                .unwrap();
+        assert_eq!(principal.foreign_id, "github-user-90210001");
+        assert_eq!(principal.name, "GitHub User @ada");
+        assert_eq!(principal.kind.as_deref(), Some("github_user"));
+        assert_eq!(
+            principal.labels.get("github_subject").map(String::as_str),
+            Some("90210001")
+        );
+        assert_eq!(principal.slack_user_id, None);
+
+        let fallback =
+            derive_github_requester_principal("github:acme/widgets:12", "90210001", None).unwrap();
+        assert_eq!(fallback.name, "GitHub User 90210001");
+    }
+
+    #[test]
+    fn github_requester_rejects_non_github_threads_and_non_numeric_ids() {
+        assert_eq!(
+            derive_github_requester_principal("slack:T123:C456:ts", "90210001", None),
+            None
+        );
+        assert_eq!(
+            derive_github_requester_principal("console:abc", "90210001", None),
+            None
+        );
+        assert_eq!(
+            derive_github_requester_principal("github:acme/widgets:12", "ada", None),
+            None
+        );
+        assert_eq!(
+            derive_github_requester_principal("github:acme/widgets:12", "  ", None),
             None
         );
     }

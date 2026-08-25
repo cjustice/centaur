@@ -13,8 +13,8 @@ use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
-    derive_principal_with_slack_team, derive_slack_requester_principal, is_direct_message,
-    slack_conversation_id,
+    derive_github_requester_principal, derive_principal_with_slack_team,
+    derive_slack_requester_principal, is_direct_message, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -124,6 +124,25 @@ impl SessionRegistrar {
         };
         if thread_key.starts_with("console:") {
             return self.console_requester(metadata).await;
+        }
+        // GitHub turns: the comment author githubbot forwards (`user_id`,
+        // `user_name` from the signature-verified webhook) is the requester.
+        // Unlike console-user principals, api-rs owns these and upserts them
+        // exactly like Slack requester principals.
+        if thread_key.starts_with("github:") {
+            let Some(user_id) = metadata.get("user_id").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            let Some(principal) = derive_github_requester_principal(
+                thread_key,
+                user_id,
+                metadata.get("user_name").and_then(Value::as_str),
+            ) else {
+                return Ok(None);
+            };
+            let mut input = principal.to_principal_input();
+            self.merge_existing_labels(&mut input).await?;
+            return Ok(Some(self.client.upsert_principal(&input).await?));
         }
         let Some(slack_team_id) = eligible_slack_requester_team(metadata) else {
             return Ok(None);
@@ -716,7 +735,10 @@ mod tests {
         });
 
         let principal = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await
             .unwrap()
             .expect("console requester resolves to the provisioned principal");
@@ -756,7 +778,10 @@ mod tests {
         let metadata = json!({ "user_email": "ada@example.com" });
 
         let principal = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await
             .unwrap();
 
@@ -774,7 +799,10 @@ mod tests {
         });
 
         let result = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await;
 
         assert!(result.is_err());
@@ -782,6 +810,77 @@ mod tests {
             requests.lock().unwrap().as_slice(),
             ["GET /api/v1/principals/lookup/console-user-ghost".to_owned()]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_upserts_github_user_principal_without_roles_or_permissions() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "user_id": "90210001",
+            "user_name": "ada"
+        });
+
+        let principal = registrar
+            .register_requester("github:acme/widgets:12", Some(&metadata))
+            .await
+            .unwrap()
+            .expect("github requester resolves to a principal");
+        assert_eq!(principal.id, "prn_github_user");
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.contains(&"GET /api/v1/principals/lookup/github-user-90210001".to_owned())
+        );
+        assert!(requests.contains(&"PUT /api/v1/principals/github-user-90210001".to_owned()));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.ends_with("/slack_channel_permissions")),
+            "github requester upserts must not write Slack channel permissions"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/prn_github_user/roles"),
+            "iron-control owns default role assignment"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_for_github_thread_without_user_id() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({ "user_name": "ada" });
+
+        let principal = registrar
+            .register_requester("github:acme/widgets:12", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_ignores_user_id_outside_github_threads() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "user_id": "90210001",
+            "user_name": "ada"
+        });
+
+        let principal = registrar
+            .register_requester("linear:issue-1", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
         server.abort();
     }
 
@@ -868,6 +967,17 @@ mod tests {
                     ("GET", "/api/v1/principals/lookup/console-user-ghost") => {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
                     }
+                    ("GET", "/api/v1/principals/lookup/github-user-90210001")
+                        if principal_exists =>
+                    {
+                        ("200 OK", github_user_principal_body())
+                    }
+                    ("GET", "/api/v1/principals/lookup/github-user-90210001") => {
+                        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+                    }
+                    ("PUT", "/api/v1/principals/github-user-90210001") => {
+                        ("200 OK", github_user_principal_body())
+                    }
                     (
                         "POST",
                         "/api/v1/principals/prn_channel/slack_channel_permissions"
@@ -902,5 +1012,9 @@ mod tests {
 
     fn console_user_principal_body() -> String {
         r#"{"data":{"id":"prn_console_user","foreign_id":"console-user-ada-example-com-abc123","name":"Ada Lovelace","labels":{}}}"#.to_owned()
+    }
+
+    fn github_user_principal_body() -> String {
+        r#"{"data":{"id":"prn_github_user","foreign_id":"github-user-90210001","name":"GitHub User @ada","labels":{"github_subject":"90210001"}}}"#.to_owned()
     }
 }
