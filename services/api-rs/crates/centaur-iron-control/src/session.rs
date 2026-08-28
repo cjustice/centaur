@@ -103,13 +103,13 @@ impl SessionRegistrar {
     }
 
     /// Bind the principal of the human requesting this turn, resolved from the
-    /// execute metadata (see [`requester_plan`]): fetched for console threads,
-    /// upserted for Slack channel and GitHub turns. Returns ``Ok(None)`` when
-    /// the metadata carries no eligible requester — for Slack that includes DM
-    /// threads (the conversation principal already is the user's) and
-    /// requesters not proven to belong to the Slack app's home team, which
-    /// prevents Slack Connect users from supplying requester credentials to a
-    /// shared channel turn.
+    /// execute metadata (see [`requester_plan`]): fetched for authenticated
+    /// Console executions and upserted for Slack channel and GitHub turns.
+    /// Returns ``Ok(None)`` when the metadata carries no eligible requester.
+    /// For Slack that includes DM threads (the conversation principal already
+    /// is the user's) and requesters not proven to belong to the Slack app's
+    /// home team, which prevents Slack Connect users from supplying requester
+    /// credentials to a shared channel turn.
     ///
     /// Unlike [`Self::register_session`], this never writes Slack channel
     /// permissions: the requester principal only scopes proxy credentials, and
@@ -169,8 +169,9 @@ impl SessionRegistrar {
 #[derive(Debug)]
 enum RequesterPlan {
     /// Fetch a principal the console service provisioned for its
-    /// authenticated user (console threads; only the console service's caller
-    /// class may write `console:` thread keys).
+    /// authenticated user. The API server strips this metadata field from
+    /// every caller except the authenticated Console service, so checking the
+    /// field also covers Console replies to non-Console threads.
     FetchExisting(String),
     /// Upsert the api-rs-owned per-user principal derived from the ingress's
     /// verified actor identity (Slack channel turns, GitHub turns).
@@ -178,7 +179,7 @@ enum RequesterPlan {
 }
 
 fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
-    if thread_key.starts_with("console:") {
+    if metadata.get("requester_principal_foreign_id").is_some() {
         let foreign_id = metadata
             .get("requester_principal_foreign_id")
             .and_then(Value::as_str)
@@ -752,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_requester_ignores_requester_foreign_id_outside_console_threads() {
+    async fn register_requester_resolves_console_requester_for_slack_thread() {
         let (base_url, requests, _bodies, server) = spawn_iron_control_stub(false).await;
         let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
@@ -760,12 +761,16 @@ mod tests {
         });
 
         let principal = registrar
-            .register_requester("linear:issue-1", Some(&metadata))
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("console requester resolves independently of the thread namespace");
 
-        assert_eq!(principal, None);
-        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(principal.id, "prn_console_user");
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/lookup/console-user-ada-example-com-abc123".to_owned()]
+        );
         server.abort();
     }
 

@@ -120,9 +120,12 @@ Console-driven runs carry a requester too: the console provisions the
 authenticated user's console-user principal
 (`ConsoleUserPrincipalProvisioner`) and passes its foreign ID as
 `requester_principal_foreign_id` in the execute metadata. api-rs resolves it
-fetch-only for `console:` thread keys — a thread namespace only the console
-service may write — and never upserts console-user principals, whose identity
-fields and reconciliation the console owns.
+fetch-only for every execution submitted by the authenticated console service,
+including replies to readable Slack threads, and never upserts console-user
+principals, whose identity fields and reconciliation the console owns. The API
+server strips `requester_principal_foreign_id` from every other caller class
+before persisting the execution, so ingress callers cannot assert a console
+identity through metadata.
 
 GitHub turns bind the comment author: githubbot forwards the webhook's
 verified sender as `user_id` (numeric GitHub id) and `user_name` in every
@@ -222,8 +225,8 @@ Slack's OIDC id_token. The principal foreign_id is derived from
 Slack-signature-verified events. The GitHub subject comes from
 signature-verified webhook payloads; a commenter can only ever supply their
 own sender id. The console requester foreign ID is provisioned server-side
-from the authenticated console user and honored only on `console:` thread
-keys. Nothing user-editable participates in matching.
+from the authenticated console user and honored only on executions submitted
+by the console service. Nothing user-editable participates in matching.
 
 Isolation: the requester binding is applied through the config barrier before
 the turn's input runs, executions are thread-serialized, and the token only
