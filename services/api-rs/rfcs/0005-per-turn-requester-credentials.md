@@ -135,7 +135,10 @@ by provider subject — GitHub collects no email scope, so the subject is the
 only workable anchor for these principals (§4). A commenter can only ever
 bind their own identity: the sender id comes from the signature-verified
 payload, and turns only run for author associations the deployment already
-allowlisted.
+allowlisted. GitHubbot work sessions (`github-manage:`, `github-issue:`, and
+`github-review:`) use the same resolution so routed comments retain the
+requester's identity; synthetic lifecycle turns remain requester-less because
+their actor ids are deliberately non-numeric.
 
 ### 2. Grant union on the proxy (console)
 

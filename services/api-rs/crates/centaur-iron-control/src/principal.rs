@@ -32,6 +32,12 @@ const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
 const DISCORD_CHANNEL_KIND: &str = "discord_channel";
 const GITHUB_USER_KIND: &str = "github_user";
+const GITHUB_THREAD_PREFIXES: &[&str] = &[
+    "github:",
+    "github-issue:",
+    "github-manage:",
+    "github-review:",
+];
 const LINEAR_ISSUE_KIND: &str = "linear_issue";
 const TEAMS_USER_KIND: &str = "teams_user";
 const TEAMS_CONVERSATION_KIND: &str = "teams_conversation";
@@ -293,14 +299,19 @@ pub fn derive_slack_requester_principal(
 /// comment author identity githubbot forwards (`user_id`, authentic from the
 /// signature-verified webhook, and `user_name`). Keys on the numeric GitHub
 /// id, labeled `github_subject` so reconciliation matches the owner's
-/// connected GitHub credential by provider subject. Returns `None` for
-/// non-GitHub thread keys and non-numeric ids (GitHub user ids are numeric).
+/// connected GitHub credential by provider subject. All thread families the
+/// GitHub ingress owns are recognized because user comments on bot-managed
+/// work run in `github-manage:` or `github-issue:` sessions. Returns `None`
+/// for non-GitHub thread keys and non-numeric ids (GitHub user ids are numeric).
 pub fn derive_github_requester_principal(
     thread_key: &str,
     github_user_id: &str,
     display_name: Option<&str>,
 ) -> Option<PrincipalRef> {
-    if !thread_key.starts_with("github:") {
+    if !GITHUB_THREAD_PREFIXES
+        .iter()
+        .any(|prefix| thread_key.starts_with(prefix))
+    {
         return None;
     }
     let user = github_user_id.trim();
@@ -765,17 +776,23 @@ mod tests {
 
     #[test]
     fn github_requester_keys_on_the_verified_user_id() {
-        let principal =
-            derive_github_requester_principal("github:acme/widgets:12", "90210001", Some("ada"))
-                .unwrap();
-        assert_eq!(principal.foreign_id, "github-user-90210001");
-        assert_eq!(principal.name, "GitHub User @ada");
-        assert_eq!(principal.kind.as_deref(), Some("github_user"));
-        assert_eq!(
-            principal.labels.get("github_subject").map(String::as_str),
-            Some("90210001")
-        );
-        assert_eq!(principal.slack_user_id, None);
+        for thread_key in [
+            "github:acme/widgets:12",
+            "github-issue:acme/widgets:12",
+            "github-manage:acme/widgets:12",
+            "github-review:acme/widgets:12",
+        ] {
+            let principal =
+                derive_github_requester_principal(thread_key, "90210001", Some("ada")).unwrap();
+            assert_eq!(principal.foreign_id, "github-user-90210001");
+            assert_eq!(principal.name, "GitHub User @ada");
+            assert_eq!(principal.kind.as_deref(), Some("github_user"));
+            assert_eq!(
+                principal.labels.get("github_subject").map(String::as_str),
+                Some("90210001")
+            );
+            assert_eq!(principal.slack_user_id, None);
+        }
 
         let fallback =
             derive_github_requester_principal("github:acme/widgets:12", "90210001", None).unwrap();

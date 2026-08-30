@@ -187,16 +187,21 @@ fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
             .filter(|foreign_id| !foreign_id.is_empty())?;
         return Some(RequesterPlan::FetchExisting(foreign_id.to_owned()));
     }
-    if thread_key.starts_with("github:") {
-        // githubbot forwards the comment author (`user_id`, `user_name`) from
-        // the signature-verified webhook payload.
-        let user_id = metadata.get("user_id").and_then(Value::as_str)?;
-        return derive_github_requester_principal(
-            thread_key,
-            user_id,
-            metadata.get("user_name").and_then(Value::as_str),
-        )
-        .map(RequesterPlan::UpsertDerived);
+    // githubbot forwards the comment author (`user_id`, `user_name`) from the
+    // signature-verified webhook payload. Let the derivation helper recognize
+    // every GitHub-owned session family, including work sessions.
+    if let Some(principal) = metadata
+        .get("user_id")
+        .and_then(Value::as_str)
+        .and_then(|user_id| {
+            derive_github_requester_principal(
+                thread_key,
+                user_id,
+                metadata.get("user_name").and_then(Value::as_str),
+            )
+        })
+    {
+        return Some(RequesterPlan::UpsertDerived(principal));
     }
     let slack_team_id = eligible_slack_requester_team(metadata)?;
     let slack_user_id = metadata.get("slack_user_id").and_then(Value::as_str)?;
@@ -894,6 +899,27 @@ mod tests {
         assert_eq!(principal, None);
         assert!(requests.lock().unwrap().is_empty());
         server.abort();
+    }
+
+    #[test]
+    fn requester_plan_resolves_github_work_session_keys() {
+        let metadata = json!({
+            "user_id": "90210001",
+            "user_name": "ada"
+        });
+
+        for thread_key in [
+            "github:acme/widgets:12",
+            "github-issue:acme/widgets:12",
+            "github-manage:acme/widgets:12",
+        ] {
+            let Some(RequesterPlan::UpsertDerived(principal)) =
+                requester_plan(thread_key, &metadata)
+            else {
+                panic!("expected a GitHub requester for {thread_key}");
+            };
+            assert_eq!(principal.foreign_id, "github-user-90210001");
+        }
     }
 
     #[test]
